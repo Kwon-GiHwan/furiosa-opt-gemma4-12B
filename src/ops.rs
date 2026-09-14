@@ -240,10 +240,7 @@ pub fn decoder_feedforward(
     );
 
     let x: DmTensor<bf16, Chip, Cluster, Slice, m![H]> = shared::rmsnorm::normalize(ctx, &x, post_ff_rms_weight);
-    let residual: DmTensor<bf16, Chip, Cluster, Slice, m![H]> = shared::residual::add_ffn_wide(ctx, &x, &residual);
-    let residual: DmTensor<bf16, Chip, Cluster, Slice, m![H]> =
-        shared::residual::scale_by_layer_gate(ctx, &residual, layer_scalar);
-    residual.view().to_hbm_view(&mut ctx.tdma, residual_hbm.view_mut());
+    shared::residual::add_and_gate_ffn(ctx, &x, &residual, layer_scalar, residual_hbm);
 }
 
 #[device(chip = 1)]

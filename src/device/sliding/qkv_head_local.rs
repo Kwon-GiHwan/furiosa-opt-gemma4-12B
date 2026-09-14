@@ -142,7 +142,7 @@ pub(crate) fn project_key_value(
     (k, v)
 }
 
-fn root_mean_square<S: M>(
+fn inverse_root_mean_square<S: M>(
     ctx: &mut Context,
     x: &DmTensor<bf16, Chip, HeadCluster, S, m![Ds]>,
 ) -> VrfTensor<f32, Chip, HeadCluster, S, m![1 # 8]> {
@@ -163,7 +163,7 @@ fn root_mean_square<S: M>(
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit();
-    let rms: DmTensor<f32, Chip, HeadCluster, S, m![1 # 8]> = ctx.main
+    let inv_rms: DmTensor<f32, Chip, HeadCluster, S, m![1 # 8]> = ctx.main
         .begin(mean_square.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
@@ -171,12 +171,14 @@ fn root_mean_square<S: M>(
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_trim::<m![1 # 4]>()
         .vector_fp_unary(FpUnaryOp::Sqrt)
+        // Reuse one reciprocal per reduction group; FpDiv follows the Sqrt FP stage.
+        .vector_fp_div_with_mode(BinaryArgMode::Mode10, 1.0)
         .vector_widen_pad::<m![1 # 8]>()
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit();
     ctx.sub
-        .begin(rms.view())
+        .begin(inv_rms.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .to_vrf()
@@ -187,7 +189,7 @@ pub(crate) fn normalize_weighted<S: M>(
     x: &DmTensor<bf16, Chip, HeadCluster, S, m![Ds]>,
     weight: &HbmTensor<bf16, Chip, m![Ds]>,
 ) -> DmTensor<bf16, Chip, HeadCluster, S, m![Ds]> {
-    let rms_vrf = root_mean_square(ctx, x);
+    let inv_rms_vrf = inverse_root_mean_square(ctx, x);
     let weight: DmTensor<bf16, Chip, HeadCluster, S, m![Ds]> = weight.to_dm(&mut ctx.tdma);
     let weight_vrf: VrfTensor<f32, Chip, HeadCluster, S, m![Ds]> = ctx.sub
         .begin(weight.view())
@@ -203,8 +205,8 @@ pub(crate) fn normalize_weighted<S: M>(
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_split::<m![Ds / 4], m![Ds % 4]>()
-        .vector_fp_binary(FpBinaryOp::DivF, &rms_vrf)
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &weight_vrf)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &inv_rms_vrf)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), &weight_vrf)
         .vector_widen_concat::<m![Ds / 8], m![Ds % 8]>()
         .vector_final()
         .cast::<bf16, m![Ds % 8 # 16]>()
@@ -216,7 +218,7 @@ pub(crate) fn normalize_value(
     ctx: &mut Context,
     x: &KvHeadTensor,
 ) -> KvHeadTensor {
-    let rms_vrf = root_mean_square(ctx, x);
+    let inv_rms_vrf = inverse_root_mean_square(ctx, x);
     ctx.main
         .begin(x.view())
         .fetch::<m![Ds / 16], m![Ds % 16]>()
@@ -225,7 +227,7 @@ pub(crate) fn normalize_value(
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_split::<m![Ds / 4], m![Ds % 4]>()
-        .vector_fp_div(&rms_vrf)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &inv_rms_vrf)
         .vector_widen_concat::<m![Ds / 8], m![Ds % 8]>()
         .vector_final()
         .cast::<bf16, m![Ds % 8 # 16]>()
@@ -399,7 +401,7 @@ pub(crate) fn normalize_native_input(
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit();
-    let rms: DmTensor<f32, Chip, QkvDualQueryCluster, Copies, m![1 # 8]> = ctx.main
+    let inv_rms: DmTensor<f32, Chip, QkvDualQueryCluster, Copies, m![1 # 8]> = ctx.main
         .begin(mean.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
@@ -407,15 +409,17 @@ pub(crate) fn normalize_native_input(
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_trim::<m![1 # 4]>()
         .vector_fp_unary(FpUnaryOp::Sqrt)
+        // Reuse one reciprocal per reduction group; FpDiv follows the Sqrt FP stage.
+        .vector_fp_div_with_mode(BinaryArgMode::Mode10, 1.0)
         .vector_widen_pad::<m![1 # 8]>()
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit();
     // Retain only the shard lanes from the initialized all-reduce replicas.
-    let rms: DmTensor<f32, Chip, QkvDualQueryCluster, Shards, m![1 # 8]> =
-        unsafe { rms.reshape() };
-    let rms_vrf: VrfTensor<f32, Chip, QkvDualQueryCluster, Shards, m![1 # 8]> = ctx.sub
-        .begin(rms.view())
+    let inv_rms: DmTensor<f32, Chip, QkvDualQueryCluster, Shards, m![1 # 8]> =
+        unsafe { inv_rms.reshape() };
+    let inv_rms_vrf: VrfTensor<f32, Chip, QkvDualQueryCluster, Shards, m![1 # 8]> = ctx.sub
+        .begin(inv_rms.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .to_vrf();
@@ -433,8 +437,8 @@ pub(crate) fn normalize_native_input(
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_split::<m![H / 4 % 30], m![H % 4]>()
-        .vector_fp_binary(FpBinaryOp::DivF, &rms_vrf)
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &weight_vrf)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &inv_rms_vrf)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), &weight_vrf)
         .vector_widen_concat::<m![H / 8 % 15], m![H % 8]>()
         .vector_final()
         .cast::<bf16, m![H % 8 # 16]>()

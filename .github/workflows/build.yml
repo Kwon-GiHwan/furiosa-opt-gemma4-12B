@@ -4,7 +4,8 @@ name: build
 #   1. 툴체인 설치 (scripts/install_toolchain.sh, README Toolchain 절차)
 #   2. 세 커널 컴파일 + 스케줄 덤프 (artifact 로 보관)
 #   3. tests/test_kernels 바이너리 빌드 (RNGD 에 제출되는 실행 파일)
-# RNGD 실행(정확도·cycles)은 Arena 자격 증명이 필요해 여기 포함하지 않는다.
+#   4. (secret 이 있을 때만) fixture 생성 후 scripts/rngd_test.sh 로 Arena 에 제출해
+#      정확도와 실제 RNGD cycles 를 받는다. secret: FURIOSA_ARENA_TOKEN, variable: FURIOSA_ARENA_URL
 
 on:
   push:
@@ -26,6 +27,9 @@ jobs:
     # 툴체인이 x86_64 Linux + GLIBC 2.34 이상만 지원한다.
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+
+    env:
+      FURIOSA_ARENA_TOKEN: ${{ secrets.FURIOSA_ARENA_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4
@@ -79,7 +83,39 @@ jobs:
       - name: Build test_kernels binary
         run: cargo furiosa-opt test --release --test test_kernels --no-run
 
+      # ---- RNGD 실행 (Arena 토큰이 등록된 저장소에서만) ----
+      - name: Set up Python for fixture generation
+        if: env.FURIOSA_ARENA_TOKEN != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/workflows/build.yml
+
+      - name: Generate kernel fixture
+        if: env.FURIOSA_ARENA_TOKEN != ''
+        run: |
+          pip install --quiet numpy safetensors torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+          python3 scripts/generate_references.py
+          ls -la ref/
+
+      - name: Run kernel tests on RNGD (accuracy + cycles)
+        if: env.FURIOSA_ARENA_TOKEN != ''
+        env:
+          FURIOSA_ARENA_URL: ${{ vars.FURIOSA_ARENA_URL }}
+          RNGD_JOB_NAME: ci-${{ github.run_id }}
+        run: |
+          ./scripts/rngd_test.sh --no-build 2>&1 | tee target/rngd_test.log
+          {
+            echo "## RNGD kernel test"
+            echo
+            echo '```'
+            grep -E "^\[|cycles=|tests passed|tests failed" target/rngd_test.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload schedules and test binary
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: stage1-${{ github.sha }}
@@ -89,3 +125,4 @@ jobs:
             target/schedules/*.json
             target/release/deps/test_kernels-*
             !target/release/deps/*.d
+            target/rngd_test.log

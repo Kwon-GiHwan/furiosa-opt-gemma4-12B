@@ -72,7 +72,7 @@ pub(crate) fn normalize_residual_distributed(
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit();
-    let inv_rms: DmTensor<f32, Chip, OutputCluster, LocalSlices, m![1 # 8]> = ctx
+    let rms: DmTensor<f32, Chip, OutputCluster, LocalSlices, m![1 # 8]> = ctx
         .main
         .begin(global_mean.view())
         .fetch::<m![1], m![1 # 8]>()
@@ -81,8 +81,6 @@ pub(crate) fn normalize_residual_distributed(
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_trim::<m![1 # 4]>()
         .vector_fp_unary(FpUnaryOp::Sqrt)
-        // Reuse one reciprocal per reduction group; FpDiv follows the Sqrt FP stage.
-        .vector_fp_div_with_mode(BinaryArgMode::Mode10, 1.0)
         .vector_widen_pad::<m![1 # 8]>()
         .vector_final()
         .commit_trim::<m![1 # 8]>()
@@ -97,9 +95,9 @@ pub(crate) fn normalize_residual_distributed(
         .fetch_cast::<f32>()
         .collect::<m![H / 8 % 60], m![H % 8]>()
         .to_vrf();
-    let inv_rms_vrf: VrfTensor<f32, Chip, OutputCluster, LocalSlices, m![1 # 8]> = ctx
+    let rms_vrf: VrfTensor<f32, Chip, OutputCluster, LocalSlices, m![1 # 8]> = ctx
         .sub
-        .begin(inv_rms.view())
+        .begin(rms.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .to_vrf();
@@ -113,8 +111,8 @@ pub(crate) fn normalize_residual_distributed(
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_split::<m![H / 4 % 120], m![H % 4]>()
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &inv_rms_vrf)
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), &weight_vrf)
+        .vector_fp_binary(FpBinaryOp::DivF, &rms_vrf)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &weight_vrf)
         .vector_widen_concat::<m![H / 8 % 60], m![H % 8]>()
         .vector_final()
         .cast::<bf16, m![H % 8 # 16]>()
@@ -187,7 +185,7 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
         .commit_trim::<m![1 # 8]>()
         .commit();
 
-    let inv_rms: DmTensor<f32, Chip, Cluster, m![1 # 32, Dummy8], m![1 # 8]> = ctx
+    let rms: DmTensor<f32, Chip, Cluster, m![1 # 32, Dummy8], m![1 # 8]> = ctx
         .main
         .begin(reduced_mean_square.view())
         .fetch::<m![1], m![1 # 8]>()
@@ -196,13 +194,11 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_trim::<m![1 # 4]>()
         .vector_fp_unary(FpUnaryOp::Sqrt)
-        // Reuse one reciprocal per reduction group; FpDiv follows the Sqrt FP stage.
-        .vector_fp_div_with_mode(BinaryArgMode::Mode10, 1.0)
         .vector_widen_pad::<m![1 # 8]>()
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit();
-    let inv_rms: DmTensor<f32, Chip, Cluster, ReducingSlices, m![1 # 8]> = unsafe { inv_rms.reshape() };
+    let rms: DmTensor<f32, Chip, Cluster, ReducingSlices, m![1 # 8]> = unsafe { rms.reshape() };
 
     let weight_dm: DmTensor<bf16, Chip, Cluster, ReducingSlices, m![H % 480]> = rms_weight.to_dm(&mut ctx.tdma);
     let weight_vrf: VrfTensor<f32, Chip, Cluster, ReducingSlices, m![H % 480]> = ctx
@@ -213,9 +209,9 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
         .collect::<m![H / 8 % 60], m![H % 8]>()
         .to_vrf();
 
-    let inv_rms_vrf: VrfTensor<f32, Chip, Cluster, ReducingSlices, m![1 # 8]> = ctx
+    let rms_vrf: VrfTensor<f32, Chip, Cluster, ReducingSlices, m![1 # 8]> = ctx
         .sub
-        .begin(inv_rms.view())
+        .begin(rms.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .to_vrf();
@@ -229,8 +225,8 @@ pub(crate) fn normalize<Cluster: M, Slice: M>(
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_split::<m![H / 4 % 120], m![H % 4]>()
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &inv_rms_vrf)
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), &weight_vrf)
+        .vector_fp_binary(FpBinaryOp::DivF, &rms_vrf)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &weight_vrf)
         .vector_widen_concat::<m![H / 8 % 60], m![H % 8]>()
         .vector_final()
         .commit_trim::<m![H % 8]>()

@@ -189,8 +189,7 @@ pub(crate) fn project_output_k_sharded_distributed(
     // Use two native FP8 lanes for x ~= s * (hi + lo / 16). Both lanes
     // consume the same weight stream, so weights are neither decoded nor
     // read twice. The scale is computed from the input, not from fixtures.
-    // Clear the FP32 sign bit before reduction; avoid squaring and sqrt.
-    let scale_value: DmTensor<f32, Chip, OutputCluster, KRows, m![1 # 8]> = ctx
+    let max_square: DmTensor<f32, Chip, OutputCluster, KRows, m![1 # 8]> = ctx
         .main
         .begin(x.view())
         .fetch::<m![Qs / 8 % 128], m![Qs % 8]>()
@@ -198,12 +197,13 @@ pub(crate) fn project_output_k_sharded_distributed(
         .collect::<m![Qs / 8 % 128], m![Qs % 8]>()
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
-        .vector_logic(LogicBinaryOpF32::BitAnd, const { f32::from_bits(0x7fff_ffff) })
         .vector_narrow_split::<m![Qs / 4 % 256], m![Qs % 4]>()
+        .vector_stash()
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), Stash)
         .vector_intra_slice_reduce::<Qs, m![1], m![1 # 4]>(IntraSliceReduceOpF32::Max)
-        .vector_fp_div(256.0)
+        .vector_fp_div(65536.0)
         .vector_widen_pad::<m![1 # 8]>()
-        .vector_clip(ClipBinaryOpF32::Max, 1.0e-15)
+        .vector_clip(ClipBinaryOpF32::Max, 1.0e-30)
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit();
@@ -211,12 +211,13 @@ pub(crate) fn project_output_k_sharded_distributed(
     let mut scales: DmTensor<f32, Chip, OutputCluster, KRows, m![Dummy8 % 2, 1 # 8]> =
         DmTensor::new();
     ctx.main
-        .begin(scale_value.view())
+        .begin(max_square.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_trim::<m![1 # 4]>()
+        .vector_fp_unary(FpUnaryOp::Sqrt)
         .vector_widen_pad::<m![1 # 8]>()
         .vector_final()
         .commit_trim::<m![1 # 8]>()
@@ -230,13 +231,14 @@ pub(crate) fn project_output_k_sharded_distributed(
         .to_vrf();
 
     ctx.main
-        .begin(scale_value.view())
+        .begin(max_square.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_trim::<m![1 # 4]>()
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 0.0625)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 0.00390625)
+        .vector_fp_unary(FpUnaryOp::Sqrt)
         .vector_widen_pad::<m![1 # 8]>()
         .vector_final()
         .commit_trim::<m![1 # 8]>()
@@ -257,38 +259,10 @@ pub(crate) fn project_output_k_sharded_distributed(
         .commit_trim::<m![Qs % 8]>()
         .commit();
 
-    // Coarse multiples of 16 are exactly representable in e4m3. Keep the
-    // existing [scale, scale / 16] reconstruction for the residual part.
-    let high_integer: DmTensor<f32, Chip, OutputCluster, KRows, m![Qs % 1024]> = ctx.main
-        .begin(normalized.view())
-        .fetch::<m![Qs / 8 % 128], m![Qs % 8]>()
-        .collect::<m![Qs / 8 % 128], m![Qs % 8]>()
-        .vector_init()
-        .vector_intra_slice_tag(TagMode::Zero)
-        .vector_narrow_split::<m![Qs / 4 % 256], m![Qs % 4]>()
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 0.0625)
-        .vector_fp_binary(FpBinaryOp::AddF, 12582912.0)
-        .vector_widen_concat::<m![Qs / 8 % 128], m![Qs % 8]>()
-        .vector_final()
-        .commit_trim::<m![Qs % 8]>()
-        .commit();
-    let coarse: DmTensor<f32, Chip, OutputCluster, KRows, m![Qs % 1024]> = ctx.main
-        .begin(high_integer.view())
-        .fetch::<m![Qs / 8 % 128], m![Qs % 8]>()
-        .collect::<m![Qs / 8 % 128], m![Qs % 8]>()
-        .vector_init()
-        .vector_intra_slice_tag(TagMode::Zero)
-        .vector_narrow_split::<m![Qs / 4 % 256], m![Qs % 4]>()
-        .vector_fp_binary(FpBinaryOp::SubF, 12582912.0)
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), 16.0)
-        .vector_widen_concat::<m![Qs / 8 % 128], m![Qs % 8]>()
-        .vector_final()
-        .commit_trim::<m![Qs % 8]>()
-        .commit();
     let mut parts: DmTensor<f8e4m3, Chip, OutputCluster, KRows, m![Dummy8 % 2, Qs % 1024]> =
         DmTensor::new();
     ctx.main
-        .begin(coarse.view())
+        .begin(normalized.view())
         .fetch::<m![Qs / 8 % 128], m![Qs % 8]>()
         .collect::<m![Qs / 8 % 128], m![Qs % 8]>()
         .cast::<f8e4m3, m![Qs % 8 # 32]>()
@@ -297,8 +271,9 @@ pub(crate) fn project_output_k_sharded_distributed(
 
     let high_vrf: VrfTensor<f32, Chip, OutputCluster, KRows, m![Qs % 1024]> = ctx
         .sub
-        .begin(coarse.view())
+        .begin(parts.view().tile::<m![Dummy8 % 2], 1, m![1 # 2, Qs % 1024]>(0))
         .fetch::<m![Qs / 8 % 128], m![Qs % 8]>()
+        .fetch_cast::<f32>()
         .collect::<m![Qs / 8 % 128], m![Qs % 8]>()
         .to_vrf();
 

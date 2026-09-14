@@ -14,7 +14,7 @@ on:
         description: Diagnostic experiment
         type: choice
         default: cross
-        options: [cross, transfer]
+        options: [cross, transfer, unprofiled]
 
 concurrency:
   group: cycle-diagnostics-${{ github.ref }}
@@ -36,7 +36,7 @@ jobs:
       max-parallel: 2
       fail-fast: false
       matrix:
-        kernel: ${{ fromJSON(inputs.probe == 'transfer' && '["sliding_attention_output"]' || '["sliding_project_qkv", "sliding_attention_output", "decoder_feedforward"]') }}
+        kernel: ${{ fromJSON(inputs.probe != 'cross' && '["sliding_attention_output"]' || '["sliding_project_qkv", "sliding_attention_output", "decoder_feedforward"]') }}
         mode: ["${{ inputs.probe }}"]
 
     env:

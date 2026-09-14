@@ -896,21 +896,18 @@ async fn measure(
     let started = Instant::now();
     let outputs = prepared.execute(ctx).await;
     let returned_us = started.elapsed().as_micros();
-    let span = collector.take_task().await;
-    let trace_wait_us = started.elapsed().as_micros() - returned_us;
-    assert!(span.end >= span.begin, "invalid Task timestamps");
-    println!(
-        "DIAG_RESULT kernel={} {} burst={} pid={} begin={} end={} cycles={} shim_us={} trace_wait_us={}",
-        test.name,
-        label,
-        burst,
-        std::process::id(),
-        span.begin,
-        span.end,
-        span.end - span.begin,
-        returned_us,
-        trace_wait_us
-    );
+    let cycles = if std::env::var("DIAG_MODE").unwrap() == "unprofiled" {
+        println!("DIAG_RESULT kernel={} {} burst={} pid={} begin=none end=none cycles=none shim_us={} trace_wait_us=0",
+            test.name, label, burst, std::process::id(), returned_us);
+        None
+    } else {
+        let span = collector.take_task().await;
+        let trace_wait_us = started.elapsed().as_micros() - returned_us;
+        assert!(span.end >= span.begin, "invalid Task timestamps");
+        println!("DIAG_RESULT kernel={} {} burst={} pid={} begin={} end={} cycles={} shim_us={} trace_wait_us={}",
+            test.name, label, burst, std::process::id(), span.begin, span.end, span.end - span.begin, returned_us, trace_wait_us);
+        Some(span.end - span.begin)
+    };
     assert!(!outputs.is_empty(), "shim produced no outputs");
     for (label, actual) in &outputs {
         assert!(
@@ -925,7 +922,7 @@ async fn measure(
             test.name
         );
     }
-    println!("    cycles={}", span.end - span.begin);
+    if let Some(cycles) = cycles { println!("    cycles={cycles}"); }
 }
 
 #[tokio::main]
@@ -933,7 +930,7 @@ async fn main() {
     assert!(profiling_enabled(), "TUC_PROFILE_LEVEL=info is required");
     let kernel = std::env::var("DIAG_KERNEL").expect("DIAG_KERNEL is required");
     let mode = std::env::var("DIAG_MODE").expect("DIAG_MODE required");
-    assert!(matches!(mode.as_str(), "cross" | "transfer"));
+    assert!(matches!(mode.as_str(), "cross" | "transfer" | "unprofiled"));
     let fixture = Fixture::load(&fixture_path());
     fixture.assert_every_expectation_is_tested();
     let test = TESTS
@@ -941,7 +938,11 @@ async fn main() {
         .find(|test| test.name == kernel)
         .expect("unknown kernel");
     let collector = Collector::default();
-    tracing::subscriber::set_global_default(collector.clone()).expect("set tracing subscriber");
+    if mode != "unprofiled" {
+        tracing::subscriber::set_global_default(collector.clone()).expect("set tracing subscriber");
+    }
+    // SDK ffi::run chooses furiosa_kernel_run when this target is disabled.
+    assert_eq!(tracing::enabled!(target: "span::npu", tracing::Level::INFO), mode != "unprofiled");
     let mut ctx = Context::acquire();
     // Exercise all kernel entry points before the experiment, so first-use
     // loading of a different kernel cannot masquerade as a wake-up effect.
@@ -964,7 +965,9 @@ async fn main() {
         "sliding_attention_output",
         "decoder_feedforward",
     ];
-    let conditions: &[&str] = if mode == "transfer" {
+    let conditions: &[&str] = if mode == "unprofiled" {
+        &["none", "sliding_attention_output"]
+    } else if mode == "transfer" {
         &["none", "transfer", "sliding_attention_output"]
     } else {
         &cross_conditions
@@ -1040,6 +1043,6 @@ async fn main() {
         "DIAG_COMPLETE kernel={kernel} mode={mode} measured={} seed={} primer={} bootstrap=3",
         conditions.len() * 9,
         conditions.len() * 3,
-        if mode == "transfer" { 3 } else { 9 }
+        conditions.iter().filter(|condition| !matches!(**condition, "none" | "transfer")).count() * 3
     );
 }

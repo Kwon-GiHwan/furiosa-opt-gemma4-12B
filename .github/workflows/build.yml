@@ -1,4 +1,4 @@
-name: build
+name: cycle-diagnostics
 
 # Stage 1 채점 서버와 같은 순서로 "빌드 가능성"을 확인한다.
 #   1. 툴체인 설치 (scripts/install_toolchain.sh, README Toolchain 절차)
@@ -8,14 +8,10 @@ name: build
 #      정확도와 실제 RNGD cycles 를 받는다. secret: FURIOSA_ARENA_TOKEN, variable: FURIOSA_ARENA_URL
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: cycle-diagnostics-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -81,7 +77,7 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Build test_kernels binary
-        run: cargo furiosa-opt test --release --test test_kernels --no-run
+        run: cargo furiosa-opt test --release --test cycle_diagnostics --no-run
 
       # ---- RNGD 실행 (Arena 토큰이 등록된 저장소에서만) ----
       - name: Set up Python for fixture generation
@@ -98,6 +94,14 @@ jobs:
           pip install --quiet numpy safetensors torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
           python3 scripts/generate_references.py
           ls -la ref/
+
+      - name: Select diagnostic executable
+        run: |
+          binary=$(find target/release/deps -maxdepth 1 -type f -name 'cycle_diagnostics-*' ! -name '*.d' -executable | head -1)
+          test -n "$binary"
+          cp "$binary" target/release/deps/test_kernels-diagnostic
+          chmod +x target/release/deps/test_kernels-diagnostic
+          touch target/release/deps/test_kernels-diagnostic
 
       - name: Run kernel tests on RNGD (accuracy + cycles)
         if: env.FURIOSA_ARENA_TOKEN != ''

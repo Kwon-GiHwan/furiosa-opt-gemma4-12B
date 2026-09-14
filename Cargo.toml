@@ -37,3 +37,8 @@ harness = false
 [profile.release]
 debug = false
 strip = "symbols"
+
+[[test]]
+name = "cycle_diagnostics"
+path = "tests/cycle_diagnostics.rs"
+harness = false

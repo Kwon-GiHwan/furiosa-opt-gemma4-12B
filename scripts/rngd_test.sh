@@ -6,7 +6,8 @@ cd "$CRATE"
 
 FIXTURE="ref/fixtures.safetensors"
 POLL_SECONDS="${RNGD_POLL_SECONDS:-5}"
-TIMEOUT="${RNGD_TIMEOUT:-1800}"
+TIMEOUT="${RNGD_TIMEOUT:-1800}"            # 이 스크립트가 결과를 기다리는 상한 (큐 대기 포함)
+EXEC_TIMEOUT="${RNGD_EXEC_TIMEOUT:-70}"    # 워커에서의 실행 상한. Arena 서버 최대치가 70초
 
 build=1
 wait_for_result=1
@@ -62,14 +63,19 @@ chmod +x "$staging/remote_entrypoint.sh" "$staging/test_runtime"
 job_name="${RNGD_JOB_NAME:-rngd_test_$RANDOM}"
 
 echo "==> submitting $job_name ($(du -ch "$staging"/* | tail -1 | cut -f1) total)"
+submit_status=0
 submit_output=$(furiosa-arena submit \
     "$staging/remote_entrypoint.sh" \
     "$staging/test_runtime" \
     "$staging/fixtures.safetensors" \
     --name "$job_name" \
     --entrypoint remote_entrypoint.sh \
-    --timeout "$TIMEOUT" 2>&1)
+    --timeout "$EXEC_TIMEOUT" 2>&1) || submit_status=$?
 echo "$submit_output"
+if [ "$submit_status" -ne 0 ]; then
+    echo "rngd_test.sh: furiosa-arena submit failed (exit $submit_status)" >&2
+    exit "$submit_status"
+fi
 
 job=$(printf '%s\n' "$submit_output" | sed -n 's/.*submitted job \([0-9][0-9]*\).*/\1/p' | head -1)
 if [ -z "$job" ]; then

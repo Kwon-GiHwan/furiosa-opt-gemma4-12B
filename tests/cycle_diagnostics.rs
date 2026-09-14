@@ -395,6 +395,20 @@ enum Prepared {
 }
 
 impl Prepared {
+    async fn read_input(&self, ctx: &mut Context) {
+        // Read-only PDMA traffic: no kernel execution and no mutation of inputs.
+        match self {
+            Self::Qkv(input) => {
+                let _ = read_bf16(ctx, &input.x).await;
+            }
+            Self::Attention(input) => {
+                let _ = read_bf16(ctx, &input.x).await;
+            }
+            Self::Feedforward(input) => {
+                let _ = read_bf16(ctx, &input.residual).await;
+            }
+        }
+    }
     async fn new(ctx: &mut Context, fixture: &Fixture, name: &str) -> Self {
         match name {
             "sliding_project_qkv" => Self::Qkv(Qkv::prepare(ctx, fixture).await),
@@ -918,6 +932,8 @@ async fn measure(
 async fn main() {
     assert!(profiling_enabled(), "TUC_PROFILE_LEVEL=info is required");
     let kernel = std::env::var("DIAG_KERNEL").expect("DIAG_KERNEL is required");
+    let mode = std::env::var("DIAG_MODE").expect("DIAG_MODE required");
+    assert!(matches!(mode.as_str(), "cross" | "transfer"));
     let fixture = Fixture::load(&fixture_path());
     fixture.assert_every_expectation_is_tested();
     let test = TESTS
@@ -931,15 +947,28 @@ async fn main() {
     // loading of a different kernel cannot masquerade as a wake-up effect.
     for bootstrap_test in TESTS {
         let mut input = Prepared::new(&mut ctx, &fixture, bootstrap_test.name).await;
-        measure(&mut ctx, &fixture, bootstrap_test, &collector, &mut input,
-            "mode=cross condition=bootstrap repetition=0 phase=bootstrap", 0).await;
+        measure(
+            &mut ctx,
+            &fixture,
+            bootstrap_test,
+            &collector,
+            &mut input,
+            &format!("mode={mode} condition=bootstrap repetition=0 phase=bootstrap"),
+            0,
+        )
+        .await;
     }
-    let conditions = [
+    let cross_conditions = [
         "none",
         "sliding_project_qkv",
         "sliding_attention_output",
         "decoder_feedforward",
     ];
+    let conditions: &[&str] = if mode == "transfer" {
+        &["none", "transfer", "sliding_attention_output"]
+    } else {
+        &cross_conditions
+    };
     for repetition in 0..3 {
         for offset in 0..conditions.len() {
             let condition = conditions[(offset + repetition) % conditions.len()];
@@ -950,12 +979,12 @@ async fn main() {
             for _ in 0..3 {
                 targets.push(Prepared::new(&mut ctx, &fixture, test.name).await);
             }
-            let mut primer = if condition == "none" {
+            let mut primer = if matches!(condition, "none" | "transfer") {
                 None
             } else {
                 Some(Prepared::new(&mut ctx, &fixture, condition).await)
             };
-            let label = format!("mode=cross condition={condition} repetition={repetition}");
+            let label = format!("mode={mode} condition={condition} repetition={repetition}");
             measure(
                 &mut ctx,
                 &fixture,
@@ -972,6 +1001,14 @@ async fn main() {
                 "DIAG_SLEEP {label} delay_ms=2000 actual_us={}",
                 slept.elapsed().as_micros()
             );
+            if condition == "transfer" {
+                let started = Instant::now();
+                seed.read_input(&mut ctx).await;
+                println!(
+                    "DIAG_TRANSFER {label} elapsed_ns={}",
+                    started.elapsed().as_nanos()
+                );
+            }
             if let Some(ref mut input) = primer {
                 let primer_test = TESTS.iter().find(|test| test.name == condition).unwrap();
                 measure(
@@ -999,5 +1036,10 @@ async fn main() {
             }
         }
     }
-    println!("DIAG_COMPLETE kernel={kernel} mode=cross measured=36 seed=12 primer=9 bootstrap=3");
+    println!(
+        "DIAG_COMPLETE kernel={kernel} mode={mode} measured={} seed={} primer={} bootstrap=3",
+        conditions.len() * 9,
+        conditions.len() * 3,
+        if mode == "transfer" { 3 } else { 9 }
+    );
 }

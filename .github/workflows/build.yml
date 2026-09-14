@@ -9,6 +9,12 @@ name: cycle-diagnostics
 
 on:
   workflow_dispatch:
+    inputs:
+      probe:
+        description: Diagnostic experiment
+        type: choice
+        default: cross
+        options: [cross, transfer]
 
 concurrency:
   group: cycle-diagnostics-${{ github.ref }}
@@ -30,8 +36,8 @@ jobs:
       max-parallel: 2
       fail-fast: false
       matrix:
-        kernel: [sliding_project_qkv, sliding_attention_output, decoder_feedforward]
-        mode: [cross]
+        kernel: ${{ fromJSON(inputs.probe == 'transfer' && '["sliding_attention_output"]' || '["sliding_project_qkv", "sliding_attention_output", "decoder_feedforward"]') }}
+        mode: ["${{ inputs.probe }}"]
 
     env:
       FURIOSA_ARENA_TOKEN: ${{ secrets.FURIOSA_ARENA_TOKEN }}

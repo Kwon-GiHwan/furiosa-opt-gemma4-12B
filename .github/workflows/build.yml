@@ -23,7 +23,11 @@ jobs:
     # 툴체인이 x86_64 Linux + GLIBC 2.34 이상만 지원한다.
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
     strategy:
+      max-parallel: 2
       fail-fast: false
       matrix:
         kernel: [sliding_project_qkv, sliding_attention_output, decoder_feedforward]
@@ -125,7 +129,10 @@ jobs:
         env:
           FURIOSA_ARENA_URL: ${{ vars.FURIOSA_ARENA_URL }}
           RNGD_JOB_NAME: COSLAB-${{ matrix.kernel }}-${{ matrix.mode }}
-        run: ./scripts/rngd_test.sh --no-build 2>&1 | tee target/rngd_test.log
+        run: |
+          rm -f target/rngd/last_job_id
+          ./scripts/rngd_test.sh --no-build 2>&1 | tee target/rngd_test.log
+          grep -q '^DIAG_COMPLETE ' target/rngd_test.log
 
       # 제출한 작업의 status / log / result 를 내려받아 artifact 와 Summary 에 남긴다.
       # 실패해도 실행되며(!cancelled), summary.json 은 이후 Slack 연동의 입력이 된다.
@@ -135,6 +142,7 @@ jobs:
         env:
           FURIOSA_ARENA_URL: ${{ vars.FURIOSA_ARENA_URL }}
         run: |
+          test -f target/rngd/last_job_id || exit 0
           ./scripts/rngd_fetch.sh | tee -a "$GITHUB_STEP_SUMMARY"
           job=$(cat target/rngd/last_job_id)
           echo "job-id=$job" >> "$GITHUB_OUTPUT"

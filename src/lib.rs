@@ -8,6 +8,9 @@
 
 use furiosa_opt_std::prelude::*;
 
+#[cfg(feature = "cycle-diagnostics")]
+pub mod diagnostics;
+
 pub mod api;
 pub mod axes;
 pub mod host;

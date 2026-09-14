@@ -14,7 +14,7 @@ on:
         description: Diagnostic experiment
         type: choice
         default: cross
-        options: [cross, transfer, unprofiled]
+        options: [cross, transfer, unprofiled, cost]
 
 concurrency:
   group: cycle-diagnostics-${{ github.ref }}
@@ -36,7 +36,7 @@ jobs:
       max-parallel: 2
       fail-fast: false
       matrix:
-        kernel: ${{ fromJSON(inputs.probe != 'cross' && '["sliding_attention_output"]' || '["sliding_project_qkv", "sliding_attention_output", "decoder_feedforward"]') }}
+        kernel: ${{ fromJSON((inputs.probe == 'transfer' || inputs.probe == 'unprofiled') && '["sliding_attention_output"]' || '["sliding_project_qkv", "sliding_attention_output", "decoder_feedforward"]') }}
         mode: ["${{ inputs.probe }}"]
 
     env:
@@ -92,7 +92,9 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Build test_kernels binary
-        run: cargo furiosa-opt test --release --test cycle_diagnostics --no-run
+        run: |
+          mkdir -p target
+          cargo furiosa-opt test --release --features cycle-diagnostics --test cycle_diagnostics --no-run --message-format=json | tee target/diagnostic-build.jsonl
 
       # ---- RNGD 실행 (Arena 토큰이 등록된 저장소에서만) ----
       - name: Set up Python for fixture generation
@@ -112,7 +114,7 @@ jobs:
 
       - name: Select diagnostic executable
         run: |
-          binary=$(find target/release/deps -maxdepth 1 -type f -name 'cycle_diagnostics-*' ! -name '*.d' -executable | head -1)
+          binary=$(python3 -c 'import json,sys; rows=[json.loads(line) for line in open(sys.argv[1]) if line.startswith("{")]; paths={r["executable"] for r in rows if r.get("reason")=="compiler-artifact" and r.get("target",{}).get("name")=="cycle_diagnostics" and r.get("executable")}; assert len(paths)==1, paths; print(paths.pop())' target/diagnostic-build.jsonl)
           test -n "$binary"
           cp "$binary" target/release/deps/test_kernels-diagnostic
           chmod +x target/release/deps/test_kernels-diagnostic

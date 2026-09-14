@@ -395,6 +395,20 @@ enum Prepared {
 }
 
 impl Prepared {
+    async fn launch(&mut self, ctx: &mut Context) -> u128 {
+        match self {
+            Self::Qkv(input) => input.launch(ctx).await,
+            Self::Attention(input) => input.launch(ctx).await,
+            Self::Feedforward(input) => input.launch(ctx).await,
+        }
+    }
+    async fn read_outputs(&self, ctx: &mut Context) -> Vec<(&'static str, Vec<f32>)> {
+        match self {
+            Self::Qkv(input) => input.read_outputs(ctx).await,
+            Self::Attention(input) => input.read_outputs(ctx).await,
+            Self::Feedforward(input) => input.read_outputs(ctx).await,
+        }
+    }
     async fn read_input(&self, ctx: &mut Context) {
         // Read-only PDMA traffic: no kernel execution and no mutation of inputs.
         match self {
@@ -515,6 +529,11 @@ impl Qkv {
             std::process::id(),
             host_us()
         );
+        let elapsed = self.launch(ctx).await;
+        println!("DIAG_HOST_LAUNCH elapsed_ns={elapsed}");
+        self.read_outputs(ctx).await
+    }
+    async fn launch(&mut self, ctx: &mut Context) -> u128 {
         let launch_started = Instant::now();
         launch(
             ops::sliding_project_qkv,
@@ -540,11 +559,9 @@ impl Qkv {
             ),
         )
         .await;
-        println!(
-            "DIAG_HOST_LAUNCH elapsed_ns={}",
-            launch_started.elapsed().as_nanos()
-        );
-
+        launch_started.elapsed().as_nanos()
+    }
+    async fn read_outputs(&self, ctx: &mut Context) -> Vec<(&'static str, Vec<f32>)> {
         let width = Ns::SIZE * Ds::SIZE;
         let k = read_bf16(ctx, &self.k_cache).await[self.slot * width..(self.slot + 1) * width]
             .to_vec();
@@ -593,6 +610,11 @@ impl Attention {
             std::process::id(),
             host_us()
         );
+        let elapsed = self.launch(ctx).await;
+        println!("DIAG_HOST_LAUNCH elapsed_ns={elapsed}");
+        self.read_outputs(ctx).await
+    }
+    async fn launch(&mut self, ctx: &mut Context) -> u128 {
         let launch_started = Instant::now();
         launch(
             ops::sliding_attention_output,
@@ -606,10 +628,9 @@ impl Attention {
             ),
         )
         .await;
-        println!(
-            "DIAG_HOST_LAUNCH elapsed_ns={}",
-            launch_started.elapsed().as_nanos()
-        );
+        launch_started.elapsed().as_nanos()
+    }
+    async fn read_outputs(&self, ctx: &mut Context) -> Vec<(&'static str, Vec<f32>)> {
         vec![("expected", read_bf16(ctx, &self.residual).await)]
     }
 }
@@ -690,6 +711,11 @@ impl Feedforward {
             std::process::id(),
             host_us()
         );
+        let elapsed = self.launch(ctx).await;
+        println!("DIAG_HOST_LAUNCH elapsed_ns={elapsed}");
+        self.read_outputs(ctx).await
+    }
+    async fn launch(&mut self, ctx: &mut Context) -> u128 {
         let launch_started = Instant::now();
         launch(
             ops::decoder_feedforward,
@@ -711,10 +737,9 @@ impl Feedforward {
             ),
         )
         .await;
-        println!(
-            "DIAG_HOST_LAUNCH elapsed_ns={}",
-            launch_started.elapsed().as_nanos()
-        );
+        launch_started.elapsed().as_nanos()
+    }
+    async fn read_outputs(&self, ctx: &mut Context) -> Vec<(&'static str, Vec<f32>)> {
         vec![("expected", read_bf16(ctx, &self.residual).await)]
     }
 }
@@ -897,15 +922,31 @@ async fn measure(
     let outputs = prepared.execute(ctx).await;
     let returned_us = started.elapsed().as_micros();
     let cycles = if std::env::var("DIAG_MODE").unwrap() == "unprofiled" {
-        println!("DIAG_RESULT kernel={} {} burst={} pid={} begin=none end=none cycles=none shim_us={} trace_wait_us=0",
-            test.name, label, burst, std::process::id(), returned_us);
+        println!(
+            "DIAG_RESULT kernel={} {} burst={} pid={} begin=none end=none cycles=none shim_us={} trace_wait_us=0",
+            test.name,
+            label,
+            burst,
+            std::process::id(),
+            returned_us
+        );
         None
     } else {
         let span = collector.take_task().await;
         let trace_wait_us = started.elapsed().as_micros() - returned_us;
         assert!(span.end >= span.begin, "invalid Task timestamps");
-        println!("DIAG_RESULT kernel={} {} burst={} pid={} begin={} end={} cycles={} shim_us={} trace_wait_us={}",
-            test.name, label, burst, std::process::id(), span.begin, span.end, span.end - span.begin, returned_us, trace_wait_us);
+        println!(
+            "DIAG_RESULT kernel={} {} burst={} pid={} begin={} end={} cycles={} shim_us={} trace_wait_us={}",
+            test.name,
+            label,
+            burst,
+            std::process::id(),
+            span.begin,
+            span.end,
+            span.end - span.begin,
+            returned_us,
+            trace_wait_us
+        );
         Some(span.end - span.begin)
     };
     assert!(!outputs.is_empty(), "shim produced no outputs");
@@ -922,7 +963,9 @@ async fn measure(
             test.name
         );
     }
-    if let Some(cycles) = cycles { println!("    cycles={cycles}"); }
+    if let Some(cycles) = cycles {
+        println!("    cycles={cycles}");
+    }
 }
 
 #[tokio::main]
@@ -930,19 +973,30 @@ async fn main() {
     assert!(profiling_enabled(), "TUC_PROFILE_LEVEL=info is required");
     let kernel = std::env::var("DIAG_KERNEL").expect("DIAG_KERNEL is required");
     let mode = std::env::var("DIAG_MODE").expect("DIAG_MODE required");
-    assert!(matches!(mode.as_str(), "cross" | "transfer" | "unprofiled"));
+    assert!(matches!(
+        mode.as_str(),
+        "cross" | "transfer" | "unprofiled" | "cost"
+    ));
     let fixture = Fixture::load(&fixture_path());
     fixture.assert_every_expectation_is_tested();
     let test = TESTS
         .iter()
         .find(|test| test.name == kernel)
         .expect("unknown kernel");
+    if mode == "cost" {
+        assert!(!tracing::enabled!(target: "span::npu", tracing::Level::INFO));
+        benchmark_cost(&fixture, test).await;
+        return;
+    }
     let collector = Collector::default();
     if mode != "unprofiled" {
         tracing::subscriber::set_global_default(collector.clone()).expect("set tracing subscriber");
     }
     // SDK ffi::run chooses furiosa_kernel_run when this target is disabled.
-    assert_eq!(tracing::enabled!(target: "span::npu", tracing::Level::INFO), mode != "unprofiled");
+    assert_eq!(
+        tracing::enabled!(target: "span::npu", tracing::Level::INFO),
+        mode != "unprofiled"
+    );
     let mut ctx = Context::acquire();
     // Exercise all kernel entry points before the experiment, so first-use
     // loading of a different kernel cannot masquerade as a wake-up effect.
@@ -1043,6 +1097,140 @@ async fn main() {
         "DIAG_COMPLETE kernel={kernel} mode={mode} measured={} seed={} primer={} bootstrap=3",
         conditions.len() * 9,
         conditions.len() * 3,
-        conditions.iter().filter(|condition| !matches!(**condition, "none" | "transfer")).count() * 3
+        conditions
+            .iter()
+            .filter(|condition| !matches!(**condition, "none" | "transfer"))
+            .count()
+            * 3
+    );
+}
+
+struct TinyWarmup {
+    input: HbmTensor<bf16, Chip, m![16]>,
+    output: HbmTensor<bf16, Chip, m![16]>,
+}
+
+impl TinyWarmup {
+    async fn prepare(ctx: &mut Context) -> Self {
+        let bytes: Vec<u8> = (0..16).flat_map(|_| 0x3f80u16.to_le_bytes()).collect();
+        Self {
+            input: HostTensor::<bf16, m![16]>::from_buf(bytes)
+                .to_hbm(&mut ctx.pdma)
+                .await,
+            output: HostTensor::<bf16, m![16]>::from_buf(vec![0; 32])
+                .to_hbm(&mut ctx.pdma)
+                .await,
+        }
+    }
+    async fn launch(&mut self, ctx: &mut Context) {
+        launch(
+            furiosa_opt_gemma4::diagnostics::warmup_copy,
+            (ctx, &self.input, &mut self.output),
+        )
+        .await;
+    }
+    async fn check(&self, ctx: &mut Context) {
+        assert_eq!(read_bf16(ctx, &self.output).await, vec![1.0; 16]);
+    }
+}
+
+fn check_outputs(fixture: &Fixture, test: &Test, outputs: &[(&'static str, Vec<f32>)]) {
+    assert!(!outputs.is_empty());
+    println!("==> {}", test.name);
+    for (label, actual) in outputs {
+        assert!(compare(
+            label,
+            fixture.expect(test.name, label),
+            actual,
+            test.atol,
+            test.rtol
+        ));
+    }
+}
+
+async fn benchmark_cost(fixture: &Fixture, test: &Test) {
+    let mut ctx = Context::acquire();
+    let attention = TESTS
+        .iter()
+        .find(|t| t.name == "sliding_attention_output")
+        .unwrap();
+    // Preload both warmup entry points and the target before any idle trial.
+    for bootstrap in [test, attention] {
+        let mut input = Prepared::new(&mut ctx, fixture, bootstrap.name).await;
+        input.launch(&mut ctx).await;
+        check_outputs(fixture, bootstrap, &input.read_outputs(&mut ctx).await);
+    }
+    let mut tiny_bootstrap = TinyWarmup::prepare(&mut ctx).await;
+    tiny_bootstrap.launch(&mut ctx).await;
+    tiny_bootstrap.check(&mut ctx).await;
+
+    let conditions = ["none", "tiny_copy", "attention"];
+    for repetition in 0..3 {
+        for offset in 0..conditions.len() {
+            let condition = conditions[(offset + repetition) % conditions.len()];
+            let mut seed = Prepared::new(&mut ctx, fixture, test.name).await;
+            let mut targets = Vec::new();
+            for _ in 0..3 {
+                targets.push(Prepared::new(&mut ctx, fixture, test.name).await);
+            }
+            let mut tiny = TinyWarmup::prepare(&mut ctx).await;
+            let mut primer = Prepared::new(&mut ctx, fixture, attention.name).await;
+            // Identical setup for every condition. Its cost is excluded from the
+            // request latency: this models a service with already-loaded weights.
+            seed.launch(&mut ctx).await;
+            check_outputs(fixture, test, &seed.read_outputs(&mut ctx).await);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            // No logging, correctness checks or profiler waits in this region.
+            // Warmup result reads are deferred; the target's output is read before
+            // stopping each completion timer. This includes runtime and output I/O.
+            let started = Instant::now();
+            match condition {
+                "tiny_copy" => tiny.launch(&mut ctx).await,
+                "attention" => {
+                    primer.launch(&mut ctx).await;
+                }
+                "none" => {}
+                _ => unreachable!(),
+            }
+            let warmup_ns = started.elapsed().as_nanos();
+            let mut outputs = Vec::new();
+            let mut completion_ns = Vec::new();
+            let mut launch_ns = Vec::new();
+            for input in &mut targets {
+                launch_ns.push(input.launch(&mut ctx).await);
+                outputs.push(input.read_outputs(&mut ctx).await);
+                completion_ns.push(started.elapsed().as_nanos());
+            }
+            let three_total_ns = completion_ns[2];
+            println!(
+                "COST_RESULT kernel={} condition={} repetition={} warmup_submit_ns={} first_total_ns={} first_target_ns={} three_total_ns={} second_ns={} third_ns={} first_launch_ns={} pid={}",
+                test.name,
+                condition,
+                repetition,
+                warmup_ns,
+                completion_ns[0],
+                completion_ns[0] - warmup_ns,
+                three_total_ns,
+                completion_ns[1] - completion_ns[0],
+                completion_ns[2] - completion_ns[1],
+                launch_ns[0],
+                std::process::id()
+            );
+            for output in outputs {
+                check_outputs(fixture, test, &output);
+            }
+            match condition {
+                "tiny_copy" => tiny.check(&mut ctx).await,
+                "attention" => {
+                    check_outputs(fixture, attention, &primer.read_outputs(&mut ctx).await)
+                }
+                _ => {}
+            }
+        }
+    }
+    println!(
+        "DIAG_COMPLETE kernel={} mode=cost trials=9 measured=27",
+        test.name
     );
 }

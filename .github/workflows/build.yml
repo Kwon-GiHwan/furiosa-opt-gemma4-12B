@@ -91,6 +91,15 @@ jobs:
             done
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # The 0.6 compile subcommand has no --features option. Enable the
+      # diagnostic feature in a temporary manifest only for device compilation.
+      - name: Compile diagnostic warmup kernel
+        run: |
+          cp Cargo.toml target/Cargo.toml.before-diagnostic
+          trap 'cp target/Cargo.toml.before-diagnostic Cargo.toml' EXIT
+          python3 -c 'from pathlib import Path; p=Path("Cargo.toml"); s=p.read_text(); assert "[features]\n" in s; p.write_text(s.replace("[features]\n", "[features]\ndefault = [\"cycle-diagnostics\"]\n", 1))'
+          cargo furiosa-opt compile diagnostics::warmup_copy --dump-schedule target/schedules/warmup_copy.json
+
       - name: Build test_kernels binary
         run: |
           mkdir -p target

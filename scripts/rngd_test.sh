@@ -60,7 +60,7 @@ cp "$BINARY" "$staging/test_runtime"
 cp "$FIXTURE" "$staging/fixtures.safetensors"
 chmod +x "$staging/remote_entrypoint.sh" "$staging/test_runtime"
 
-job_name="${RNGD_JOB_NAME:-rngd_test_$RANDOM}"
+job_name="${RNGD_JOB_NAME:-COSLAB}"
 
 echo "==> submitting $job_name ($(du -ch "$staging"/* | tail -1 | cut -f1) total)"
 submit_status=0
@@ -82,6 +82,9 @@ if [ -z "$job" ]; then
     echo "rngd_test.sh: could not find a job id in furiosa-arena's output (shown above)" >&2
     exit 1
 fi
+# rngd_fetch.sh 가 인자 없이 이 작업을 찾을 수 있게 남긴다
+mkdir -p "${RNGD_OUT_DIR:-target/rngd}"
+printf '%s\n' "$job" > "${RNGD_OUT_DIR:-target/rngd}/last_job_id"
 
 if [ "$wait_for_result" -eq 0 ]; then
     echo "==> submitted job $job; follow it with: furiosa-arena logs $job"

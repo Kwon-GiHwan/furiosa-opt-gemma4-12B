@@ -1,0 +1,91 @@
+name: build
+
+# Stage 1 채점 서버와 같은 순서로 "빌드 가능성"을 확인한다.
+#   1. 툴체인 설치 (scripts/install_toolchain.sh, README Toolchain 절차)
+#   2. 세 커널 컴파일 + 스케줄 덤프 (artifact 로 보관)
+#   3. tests/test_kernels 바이너리 빌드 (RNGD 에 제출되는 실행 파일)
+# RNGD 실행(정확도·cycles)은 Arena 자격 증명이 필요해 여기 포함하지 않는다.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    # 툴체인이 x86_64 Linux + GLIBC 2.34 이상만 지원한다.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache toolchain binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.rustup/toolchains
+          key: toolchain-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'scripts/install_toolchain.sh') }}
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'rust-toolchain.toml') }}-
+            cargo-${{ runner.os }}-
+
+      - name: Install toolchain
+        run: bash scripts/install_toolchain.sh
+
+      - name: Compile Stage 1 kernels and dump schedules
+        run: |
+          mkdir -p target/schedules
+          for k in sliding_project_qkv sliding_attention_output decoder_feedforward; do
+            echo "::group::ops::$k"
+            cargo furiosa-opt compile "ops::$k" --exact \
+              --dump-schedule "target/schedules/$k.json"
+            echo "::endgroup::"
+          done
+
+      - name: Report schedule makespans
+        run: |
+          {
+            echo "## Schedule makespan (compiler estimate, not RNGD cycles)"
+            echo
+            echo "| kernel | makespan |"
+            echo "|---|---:|"
+            for f in target/schedules/*.json; do
+              k=$(basename "$f" .json)
+              m=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(max(i['lifetime']['end'] for i in d['instructions']))" "$f")
+              echo "| $k | $m |"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Build test_kernels binary
+        run: cargo furiosa-opt test --release --test test_kernels --no-run
+
+      - name: Upload schedules and test binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage1-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            target/schedules/*.json
+            target/release/deps/test_kernels-*
+            !target/release/deps/*.d

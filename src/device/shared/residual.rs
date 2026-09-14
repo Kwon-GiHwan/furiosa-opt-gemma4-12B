@@ -151,13 +151,24 @@ pub(crate) fn add_vision<Cluster: M, Slice: M>(
     output
 }
 
-// FFN-only wider residual tiles; preserves the original BF16 boundary.
-pub(crate) fn add_ffn_wide(
+// Apply the layer gate per FFN residual tile. The BF16 commit between
+// addition and multiplication preserves the original rounding boundary.
+pub(crate) fn add_ffn_wide_and_gate(
     ctx: &mut Context,
     x: &DmTensor<bf16, Chip, Cluster, Slice, m![H]>,
     residual: &DmTensor<bf16, Chip, Cluster, Slice, m![H]>,
+    scalar: &HbmTensor<bf16, Chip, m![1 # 8]>,
 ) -> DmTensor<bf16, Chip, Cluster, Slice, m![H]> {
     const TILES: usize = H::SIZE / 1920;
+
+    let scalar: DmTensor<bf16, Chip, Cluster, Slice, m![1 # 8]> = scalar.to_dm(&mut ctx.tdma);
+    let scalar: VrfTensor<f32, Chip, Cluster, Slice, m![1 # 8]> = ctx
+        .sub
+        .begin(scalar.view())
+        .fetch::<m![1], m![1 # 8]>()
+        .fetch_cast::<f32>()
+        .collect::<m![1], m![1 # 8]>()
+        .to_vrf();
 
     let mut output: DmTensor<bf16, Chip, Cluster, Slice, m![H]> = DmTensor::new();
 
@@ -173,7 +184,7 @@ pub(crate) fn add_ffn_wide(
             .collect::<m![H = 1920 / 8], m![H = 1920 % 8]>()
             .to_vrf();
 
-        ctx.main
+        let rounded: DmTensor<bf16, Chip, Cluster, Slice, m![H = 1920]> = ctx.main
             .begin(x_tile)
             .fetch::<m![1], m![H = 1920]>()
             .fetch_cast::<f32>()
@@ -181,6 +192,21 @@ pub(crate) fn add_ffn_wide(
             .vector_init()
             .vector_intra_slice_tag(TagMode::Zero)
             .vector_clip(ClipBinaryOpF32::Add, &residual_vrf)
+            .vector_final()
+            .cast::<bf16, m![H = 1920 % 8 # 16]>()
+            .commit_trim::<m![H = 1920 % 8]>()
+            .commit();
+
+        ctx.main
+            .begin(rounded.view())
+            .fetch::<m![H = 1920 / 16], m![H = 1920 % 16]>()
+            .fetch_cast::<f32>()
+            .collect::<m![H = 1920 / 8], m![H = 1920 % 8]>()
+            .vector_init()
+            .vector_intra_slice_tag(TagMode::Zero)
+            .vector_narrow_split::<m![H = 1920 / 4], m![H = 1920 % 4]>()
+            .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), &scalar)
+            .vector_widen_concat::<m![H = 1920 / 8], m![H = 1920 % 8]>()
             .vector_final()
             .cast::<bf16, m![H = 1920 % 8 # 16]>()
             .commit_trim::<m![H = 1920 % 8]>()

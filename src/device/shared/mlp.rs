@@ -24,44 +24,42 @@ fn prepare_up_input(
     // Quantize disjoint 960-element groups once, not once per output row.
     let x: DmTensor<bf16, Chip, Cluster, m![H / 960, 1 # 64], m![H % 960]> =
         x.to_dm(&mut ctx.tdma);
-    let max_square: DmTensor<f32, Chip, Cluster, m![H / 960, 1 # 64], m![1 # 8]> = ctx.main
+    // Clear the FP32 sign bit before reduction; avoid squaring and sqrt.
+    let scale_value: DmTensor<f32, Chip, Cluster, m![H / 960, 1 # 64], m![1 # 8]> = ctx.main
         .begin(x.view())
         .fetch::<m![H / 8 % 120], m![H % 8]>()
         .fetch_cast::<f32>()
         .collect::<m![H / 8 % 120], m![H % 8]>()
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
+        .vector_logic(LogicBinaryOpF32::BitAnd, const { f32::from_bits(0x7fff_ffff) })
         .vector_narrow_split::<m![H / 4 % 240], m![H % 4]>()
-        .vector_stash()
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), Stash)
         .vector_intra_slice_reduce::<H, m![1], m![1 # 4]>(IntraSliceReduceOpF32::Max)
-        .vector_fp_div(65536.0f32)
+        .vector_fp_div(256.0f32)
         .vector_widen_pad::<m![1 # 8]>()
-        .vector_clip(ClipBinaryOpF32::Max, 1.0e-30f32)
+        .vector_clip(ClipBinaryOpF32::Max, 1.0e-15f32)
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit();
 
     let mut scales: DmTensor<f32, Chip, Cluster, m![H / 960, 1 # 64], m![Dummy2, 1 # 8]> = DmTensor::new();
-    ctx.main.begin(max_square.view())
+    ctx.main.begin(scale_value.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_trim::<m![1 # 4]>()
-        .vector_fp_unary(FpUnaryOp::Sqrt)
         .vector_widen_pad::<m![1 # 8]>()
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit_view(scales.view_mut().tile::<m![Dummy2], 1, m![1 #{!} 2, 1 # 8]>(0));
-    ctx.main.begin(max_square.view())
+    ctx.main.begin(scale_value.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_trim::<m![1 # 4]>()
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 0.00390625f32)
-        .vector_fp_unary(FpUnaryOp::Sqrt)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 0.0625f32)
         .vector_widen_pad::<m![1 # 8]>()
         .vector_final()
         .commit_trim::<m![1 # 8]>()
@@ -142,44 +140,42 @@ fn prepare_down_input(
     // Quantize disjoint 960-element groups once, not once per output row.
     let x: DmTensor<bf16, Chip, UpCluster, m![L / 960 % 8, 1 # 32], m![L % 960]> =
         x.to_dm(&mut ctx.tdma);
-    let max_square: DmTensor<f32, Chip, UpCluster, m![L / 960 % 8, 1 # 32], m![1 # 8]> = ctx.main
+    // Clear the FP32 sign bit before reduction; avoid squaring and sqrt.
+    let scale_value: DmTensor<f32, Chip, UpCluster, m![L / 960 % 8, 1 # 32], m![1 # 8]> = ctx.main
         .begin(x.view())
         .fetch::<m![L / 8 % 120], m![L % 8]>()
         .fetch_cast::<f32>()
         .collect::<m![L / 8 % 120], m![L % 8]>()
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
+        .vector_logic(LogicBinaryOpF32::BitAnd, const { f32::from_bits(0x7fff_ffff) })
         .vector_narrow_split::<m![L / 4 % 240], m![L % 4]>()
-        .vector_stash()
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), Stash)
         .vector_intra_slice_reduce::<L, m![1], m![1 # 4]>(IntraSliceReduceOpF32::Max)
-        .vector_fp_div(65536.0f32)
+        .vector_fp_div(256.0f32)
         .vector_widen_pad::<m![1 # 8]>()
-        .vector_clip(ClipBinaryOpF32::Max, 1.0e-30f32)
+        .vector_clip(ClipBinaryOpF32::Max, 1.0e-15f32)
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit();
 
     let mut scales: DmTensor<f32, Chip, UpCluster, m![L / 960 % 8, 1 # 32], m![Dummy2, 1 # 8]> = DmTensor::new();
-    ctx.main.begin(max_square.view())
+    ctx.main.begin(scale_value.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_trim::<m![1 # 4]>()
-        .vector_fp_unary(FpUnaryOp::Sqrt)
         .vector_widen_pad::<m![1 # 8]>()
         .vector_final()
         .commit_trim::<m![1 # 8]>()
         .commit_view(scales.view_mut().tile::<m![Dummy2], 1, m![1 #{!} 2, 1 # 8]>(0));
-    ctx.main.begin(max_square.view())
+    ctx.main.begin(scale_value.view())
         .fetch::<m![1], m![1 # 8]>()
         .collect::<m![1], m![1 # 8]>()
         .vector_init()
         .vector_intra_slice_tag(TagMode::Zero)
         .vector_narrow_trim::<m![1 # 4]>()
-        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 0.00390625f32)
-        .vector_fp_unary(FpUnaryOp::Sqrt)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 0.0625f32)
         .vector_widen_pad::<m![1 # 8]>()
         .vector_final()
         .commit_trim::<m![1 # 8]>()

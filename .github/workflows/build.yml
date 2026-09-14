@@ -31,7 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         kernel: [sliding_project_qkv, sliding_attention_output, decoder_feedforward]
-        mode: [same, fresh]
+        mode: [cross]
 
     env:
       FURIOSA_ARENA_TOKEN: ${{ secrets.FURIOSA_ARENA_TOKEN }}

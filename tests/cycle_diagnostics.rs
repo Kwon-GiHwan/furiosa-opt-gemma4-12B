@@ -388,156 +388,321 @@ const TESTS: &[Test] = &[
     },
 ];
 
-async fn run_test(ctx: &mut Context, fixture: &Fixture, name: &'static str) -> Vec<(&'static str, Vec<f32>)> {
-    match name {
-        "sliding_project_qkv" => sliding_project_qkv(ctx, fixture).await,
-        "sliding_attention_output" => sliding_attention_output(ctx, fixture).await,
-        "decoder_feedforward" => decoder_feedforward(ctx, fixture).await,
-        other => panic!("no shim for test `{other}` -- add one in run_test"),
+enum Prepared {
+    Qkv(Qkv),
+    Attention(Attention),
+    Feedforward(Feedforward),
+}
+
+impl Prepared {
+    async fn new(ctx: &mut Context, fixture: &Fixture, name: &str) -> Self {
+        match name {
+            "sliding_project_qkv" => Self::Qkv(Qkv::prepare(ctx, fixture).await),
+            "sliding_attention_output" => Self::Attention(Attention::prepare(ctx, fixture).await),
+            "decoder_feedforward" => Self::Feedforward(Feedforward::prepare(ctx, fixture).await),
+            _ => panic!("unknown kernel"),
+        }
+    }
+    async fn execute(&mut self, ctx: &mut Context) -> Vec<(&'static str, Vec<f32>)> {
+        match self {
+            Self::Qkv(input) => input.execute(ctx).await,
+            Self::Attention(input) => input.execute(ctx).await,
+            Self::Feedforward(input) => input.execute(ctx).await,
+        }
     }
 }
 
-async fn sliding_project_qkv(ctx: &mut Context, fixture: &Fixture) -> Vec<(&'static str, Vec<f32>)> {
-    let s = Synth::new("sliding_project_qkv", fixture);
-
-    let input_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "input_rms_weight", RMS_WEIGHT).await;
-    let x: HbmTensor<bf16, Chip, m![H]> = exact_rmsnorm_input(ctx, &s).await;
-
-    let q_weight: HbmTensor<f8e4m3, Chip, m![Qs, H]> = s.f8(ctx, "q_weight", WEIGHT_EXP, true).await;
-    let k_weight: HbmTensor<f8e4m3, Chip, m![Ps, H]> = s.f8(ctx, "k_weight", WEIGHT_EXP, true).await;
-    let v_weight: HbmTensor<f8e4m3, Chip, m![Ps, H]> = s.f8(ctx, "v_weight", WEIGHT_EXP, true).await;
-    let q_weight_scale: HbmTensor<bf16, Chip, m![Qs]> = s.bf16(ctx, "q_weight_scale", ROW_SCALE).await;
-    let k_weight_scale: HbmTensor<bf16, Chip, m![Ps]> = s.bf16(ctx, "k_weight_scale", ROW_SCALE).await;
-    let v_weight_scale: HbmTensor<bf16, Chip, m![Ps]> = s.bf16(ctx, "v_weight_scale", ROW_SCALE).await;
-    let q_rms_weight: HbmTensor<bf16, Chip, m![Ds]> = s.bf16(ctx, "q_rms_weight", UNIT).await;
-    let k_rms_weight: HbmTensor<bf16, Chip, m![Ds]> = s.bf16(ctx, "k_rms_weight", UNIT).await;
-
-    let (cos_values, sin_values) = rope_tables(Ds::SIZE, 10_000.0, 1.0, POS);
-    let cos: HbmTensor<bf16, Chip, m![E, Ds]> = rope_table::<Ds>(ctx, &s, "cos", &cos_values, POS).await;
-    let sin: HbmTensor<bf16, Chip, m![E, Ds]> =
-        rope_table::<Ds>(ctx, &s, "sin", &negate_low_half(&sin_values), POS).await;
-    let rope_offset: HbmTensor<i32, Chip, m![1]> =
-        s.constant_i32(ctx, "rope_offset", (POS * Ds::SIZE * 2) as i32).await;
-
-    let slot = POS % Ts::SIZE;
-    let offset = (slot * Ns::SIZE * Ds::SIZE * 2) as i32;
-    let kv_offset: HbmTensor<i32, Chip, m![1]> = s.constant_i32(ctx, "kv_offset", offset).await;
-
-    let mut k_cache: HbmTensor<bf16, Chip, m![Ts, Ns, Ds]> = zeros(ctx).await;
-    let mut v_cache: HbmTensor<bf16, Chip, m![Ts, Ns, Ds]> = zeros(ctx).await;
-    let mut q_out: HbmTensor<bf16, Chip, m![Ns, Gs, Ds]> = zeros(ctx).await;
-
-    println!("DIAG_LAUNCH pid={} host_us={}", std::process::id(), host_us());
-    launch(
-        ops::sliding_project_qkv,
-        (
-            ctx,
-            &x,
-            &q_weight,
-            &k_weight,
-            &v_weight,
-            &q_weight_scale,
-            &k_weight_scale,
-            &v_weight_scale,
-            &input_rms_weight,
-            &q_rms_weight,
-            &k_rms_weight,
-            &kv_offset,
-            &rope_offset,
-            &cos,
-            &sin,
-            &mut k_cache,
-            &mut v_cache,
-            &mut q_out,
-        ),
-    )
-    .await;
-
-    let width = Ns::SIZE * Ds::SIZE;
-    let k = read_bf16(ctx, &k_cache).await[slot * width..(slot + 1) * width].to_vec();
-    let v = read_bf16(ctx, &v_cache).await[slot * width..(slot + 1) * width].to_vec();
-    vec![
-        ("expected.q", read_bf16(ctx, &q_out).await),
-        ("expected.k", k),
-        ("expected.v", v),
-    ]
+struct Qkv {
+    input_rms_weight: HbmTensor<bf16, Chip, m![H]>,
+    x: HbmTensor<bf16, Chip, m![H]>,
+    q_weight: HbmTensor<f8e4m3, Chip, m![Qs, H]>,
+    k_weight: HbmTensor<f8e4m3, Chip, m![Ps, H]>,
+    v_weight: HbmTensor<f8e4m3, Chip, m![Ps, H]>,
+    q_weight_scale: HbmTensor<bf16, Chip, m![Qs]>,
+    k_weight_scale: HbmTensor<bf16, Chip, m![Ps]>,
+    v_weight_scale: HbmTensor<bf16, Chip, m![Ps]>,
+    q_rms_weight: HbmTensor<bf16, Chip, m![Ds]>,
+    k_rms_weight: HbmTensor<bf16, Chip, m![Ds]>,
+    cos: HbmTensor<bf16, Chip, m![E, Ds]>,
+    sin: HbmTensor<bf16, Chip, m![E, Ds]>,
+    rope_offset: HbmTensor<i32, Chip, m![1]>,
+    kv_offset: HbmTensor<i32, Chip, m![1]>,
+    k_cache: HbmTensor<bf16, Chip, m![Ts, Ns, Ds]>,
+    v_cache: HbmTensor<bf16, Chip, m![Ts, Ns, Ds]>,
+    q_out: HbmTensor<bf16, Chip, m![Ns, Gs, Ds]>,
+    slot: usize,
 }
 
-async fn sliding_attention_output(ctx: &mut Context, fixture: &Fixture) -> Vec<(&'static str, Vec<f32>)> {
-    let s = Synth::new("sliding_attention_output", fixture);
-    let x: HbmTensor<bf16, Chip, m![Ns, Gs, Ds]> = s.signs(ctx, "x", 1.0).await;
-    let post_attn_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "post_attn_rms_weight", UNIT).await;
-    let o_weight: HbmTensor<f8e4m3, Chip, m![H, Qs]> = s.f8(ctx, "o_weight", WEIGHT_EXP, true).await;
-    let o_weight_scale: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "o_weight_scale", ROW_SCALE).await;
-    let mut residual: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "residual", UNIT).await;
+impl Qkv {
+    async fn prepare(ctx: &mut Context, fixture: &Fixture) -> Self {
+        let s = Synth::new("sliding_project_qkv", fixture);
 
-    println!("DIAG_LAUNCH pid={} host_us={}", std::process::id(), host_us());
-    launch(
-        ops::sliding_attention_output,
-        (
-            ctx,
-            &x,
-            &post_attn_rms_weight,
-            &o_weight,
-            &o_weight_scale,
-            &mut residual,
-        ),
-    )
-    .await;
-    vec![("expected", read_bf16(ctx, &residual).await)]
+        let input_rms_weight: HbmTensor<bf16, Chip, m![H]> =
+            s.bf16(ctx, "input_rms_weight", RMS_WEIGHT).await;
+        let x: HbmTensor<bf16, Chip, m![H]> = exact_rmsnorm_input(ctx, &s).await;
+
+        let q_weight: HbmTensor<f8e4m3, Chip, m![Qs, H]> =
+            s.f8(ctx, "q_weight", WEIGHT_EXP, true).await;
+        let k_weight: HbmTensor<f8e4m3, Chip, m![Ps, H]> =
+            s.f8(ctx, "k_weight", WEIGHT_EXP, true).await;
+        let v_weight: HbmTensor<f8e4m3, Chip, m![Ps, H]> =
+            s.f8(ctx, "v_weight", WEIGHT_EXP, true).await;
+        let q_weight_scale: HbmTensor<bf16, Chip, m![Qs]> =
+            s.bf16(ctx, "q_weight_scale", ROW_SCALE).await;
+        let k_weight_scale: HbmTensor<bf16, Chip, m![Ps]> =
+            s.bf16(ctx, "k_weight_scale", ROW_SCALE).await;
+        let v_weight_scale: HbmTensor<bf16, Chip, m![Ps]> =
+            s.bf16(ctx, "v_weight_scale", ROW_SCALE).await;
+        let q_rms_weight: HbmTensor<bf16, Chip, m![Ds]> = s.bf16(ctx, "q_rms_weight", UNIT).await;
+        let k_rms_weight: HbmTensor<bf16, Chip, m![Ds]> = s.bf16(ctx, "k_rms_weight", UNIT).await;
+
+        let (cos_values, sin_values) = rope_tables(Ds::SIZE, 10_000.0, 1.0, POS);
+        let cos: HbmTensor<bf16, Chip, m![E, Ds]> =
+            rope_table::<Ds>(ctx, &s, "cos", &cos_values, POS).await;
+        let sin: HbmTensor<bf16, Chip, m![E, Ds]> =
+            rope_table::<Ds>(ctx, &s, "sin", &negate_low_half(&sin_values), POS).await;
+        let rope_offset: HbmTensor<i32, Chip, m![1]> = s
+            .constant_i32(ctx, "rope_offset", (POS * Ds::SIZE * 2) as i32)
+            .await;
+
+        let slot = POS % Ts::SIZE;
+        let offset = (slot * Ns::SIZE * Ds::SIZE * 2) as i32;
+        let kv_offset: HbmTensor<i32, Chip, m![1]> = s.constant_i32(ctx, "kv_offset", offset).await;
+
+        let k_cache: HbmTensor<bf16, Chip, m![Ts, Ns, Ds]> = zeros(ctx).await;
+        let v_cache: HbmTensor<bf16, Chip, m![Ts, Ns, Ds]> = zeros(ctx).await;
+        let q_out: HbmTensor<bf16, Chip, m![Ns, Gs, Ds]> = zeros(ctx).await;
+
+        Self {
+            input_rms_weight,
+            x,
+            q_weight,
+            k_weight,
+            v_weight,
+            q_weight_scale,
+            k_weight_scale,
+            v_weight_scale,
+            q_rms_weight,
+            k_rms_weight,
+            cos,
+            sin,
+            rope_offset,
+            kv_offset,
+            k_cache,
+            v_cache,
+            q_out,
+            slot,
+        }
+    }
+
+    async fn execute(&mut self, ctx: &mut Context) -> Vec<(&'static str, Vec<f32>)> {
+        println!(
+            "DIAG_LAUNCH pid={} host_us={}",
+            std::process::id(),
+            host_us()
+        );
+        let launch_started = Instant::now();
+        launch(
+            ops::sliding_project_qkv,
+            (
+                ctx,
+                &self.x,
+                &self.q_weight,
+                &self.k_weight,
+                &self.v_weight,
+                &self.q_weight_scale,
+                &self.k_weight_scale,
+                &self.v_weight_scale,
+                &self.input_rms_weight,
+                &self.q_rms_weight,
+                &self.k_rms_weight,
+                &self.kv_offset,
+                &self.rope_offset,
+                &self.cos,
+                &self.sin,
+                &mut self.k_cache,
+                &mut self.v_cache,
+                &mut self.q_out,
+            ),
+        )
+        .await;
+        println!(
+            "DIAG_HOST_LAUNCH elapsed_ns={}",
+            launch_started.elapsed().as_nanos()
+        );
+
+        let width = Ns::SIZE * Ds::SIZE;
+        let k = read_bf16(ctx, &self.k_cache).await[self.slot * width..(self.slot + 1) * width]
+            .to_vec();
+        let v = read_bf16(ctx, &self.v_cache).await[self.slot * width..(self.slot + 1) * width]
+            .to_vec();
+        vec![
+            ("expected.q", read_bf16(ctx, &self.q_out).await),
+            ("expected.k", k),
+            ("expected.v", v),
+        ]
+    }
 }
 
-async fn decoder_feedforward(ctx: &mut Context, fixture: &Fixture) -> Vec<(&'static str, Vec<f32>)> {
-    let s = Synth::new("decoder_feedforward", fixture);
+struct Attention {
+    x: HbmTensor<bf16, Chip, m![Ns, Gs, Ds]>,
+    post_attn_rms_weight: HbmTensor<bf16, Chip, m![H]>,
+    o_weight: HbmTensor<f8e4m3, Chip, m![H, Qs]>,
+    o_weight_scale: HbmTensor<bf16, Chip, m![H]>,
+    residual: HbmTensor<bf16, Chip, m![H]>,
+}
 
-    let mut residual: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "residual", UNIT).await;
-    let pre_ff_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "pre_ff_rms_weight", UNIT).await;
-    let post_ff_rms_weight: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "post_ff_rms_weight", UNIT).await;
+impl Attention {
+    async fn prepare(ctx: &mut Context, fixture: &Fixture) -> Self {
+        let s = Synth::new("sliding_attention_output", fixture);
+        let x: HbmTensor<bf16, Chip, m![Ns, Gs, Ds]> = s.signs(ctx, "x", 1.0).await;
+        let post_attn_rms_weight: HbmTensor<bf16, Chip, m![H]> =
+            s.bf16(ctx, "post_attn_rms_weight", UNIT).await;
+        let o_weight: HbmTensor<f8e4m3, Chip, m![H, Qs]> =
+            s.f8(ctx, "o_weight", WEIGHT_EXP, true).await;
+        let o_weight_scale: HbmTensor<bf16, Chip, m![H]> =
+            s.bf16(ctx, "o_weight_scale", ROW_SCALE).await;
+        let residual: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "residual", UNIT).await;
 
-    let up_weight_packed: HbmTensor<f4e2m1, Chip, m![L, H]> = s.f4(ctx, "up_weight_packed").await;
-    let gate_weight_packed: HbmTensor<f4e2m1, Chip, m![L, H]> = s.f4(ctx, "gate_weight_packed").await;
-    let down_weight_packed: HbmTensor<f4e2m1, Chip, m![H, L]> = s.f4(ctx, "down_weight_packed").await;
-    let up_weight_scale: HbmTensor<f8e4m3, Chip, m![L, H / 16]> =
-        s.f8(ctx, "up_weight_scale", LOCAL_SCALE_EXP, false).await;
-    let gate_weight_scale: HbmTensor<f8e4m3, Chip, m![L, H / 16]> =
-        s.f8(ctx, "gate_weight_scale", LOCAL_SCALE_EXP, false).await;
-    let down_weight_scale: HbmTensor<f8e4m3, Chip, m![H, L / 16]> =
-        s.f8(ctx, "down_weight_scale", LOCAL_SCALE_EXP, false).await;
+        Self {
+            x,
+            post_attn_rms_weight,
+            o_weight,
+            o_weight_scale,
+            residual,
+        }
+    }
 
-    let up_global_scale: HbmTensor<f32, Chip, m![1]> = s
-        .constant_f32(ctx, "up_global_scale", &[1.0 / RAW_GLOBAL_SCALES[0]])
+    async fn execute(&mut self, ctx: &mut Context) -> Vec<(&'static str, Vec<f32>)> {
+        println!(
+            "DIAG_LAUNCH pid={} host_us={}",
+            std::process::id(),
+            host_us()
+        );
+        let launch_started = Instant::now();
+        launch(
+            ops::sliding_attention_output,
+            (
+                ctx,
+                &self.x,
+                &self.post_attn_rms_weight,
+                &self.o_weight,
+                &self.o_weight_scale,
+                &mut self.residual,
+            ),
+        )
         .await;
-    let gate_global_scale: HbmTensor<f32, Chip, m![1]> = s
-        .constant_f32(ctx, "gate_global_scale", &[1.0 / RAW_GLOBAL_SCALES[1]])
-        .await;
-    let down_global_scale: HbmTensor<f32, Chip, m![1]> = s
-        .constant_f32(ctx, "down_global_scale", &[1.0 / RAW_GLOBAL_SCALES[2]])
-        .await;
+        println!(
+            "DIAG_HOST_LAUNCH elapsed_ns={}",
+            launch_started.elapsed().as_nanos()
+        );
+        vec![("expected", read_bf16(ctx, &self.residual).await)]
+    }
+}
 
-    let layer_scalar: HbmTensor<bf16, Chip, m![1 # 8]> = s.constant_bf16(ctx, "layer_scalar", &[LAYER_SCALAR; 8]).await;
+struct Feedforward {
+    residual: HbmTensor<bf16, Chip, m![H]>,
+    pre_ff_rms_weight: HbmTensor<bf16, Chip, m![H]>,
+    post_ff_rms_weight: HbmTensor<bf16, Chip, m![H]>,
+    up_weight_packed: HbmTensor<f4e2m1, Chip, m![L, H]>,
+    gate_weight_packed: HbmTensor<f4e2m1, Chip, m![L, H]>,
+    down_weight_packed: HbmTensor<f4e2m1, Chip, m![H, L]>,
+    up_weight_scale: HbmTensor<f8e4m3, Chip, m![L, H / 16]>,
+    gate_weight_scale: HbmTensor<f8e4m3, Chip, m![L, H / 16]>,
+    down_weight_scale: HbmTensor<f8e4m3, Chip, m![H, L / 16]>,
+    up_global_scale: HbmTensor<f32, Chip, m![1]>,
+    gate_global_scale: HbmTensor<f32, Chip, m![1]>,
+    down_global_scale: HbmTensor<f32, Chip, m![1]>,
+    layer_scalar: HbmTensor<bf16, Chip, m![1 # 8]>,
+}
 
-    println!("DIAG_LAUNCH pid={} host_us={}", std::process::id(), host_us());
-    launch(
-        ops::decoder_feedforward,
-        (
-            ctx,
-            &mut residual,
-            &pre_ff_rms_weight,
-            &up_weight_packed,
-            &gate_weight_packed,
-            &down_weight_packed,
-            &up_weight_scale,
-            &gate_weight_scale,
-            &down_weight_scale,
-            &up_global_scale,
-            &gate_global_scale,
-            &down_global_scale,
-            &post_ff_rms_weight,
-            &layer_scalar,
-        ),
-    )
-    .await;
-    vec![("expected", read_bf16(ctx, &residual).await)]
+impl Feedforward {
+    async fn prepare(ctx: &mut Context, fixture: &Fixture) -> Self {
+        let s = Synth::new("decoder_feedforward", fixture);
+
+        let residual: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "residual", UNIT).await;
+        let pre_ff_rms_weight: HbmTensor<bf16, Chip, m![H]> =
+            s.bf16(ctx, "pre_ff_rms_weight", UNIT).await;
+        let post_ff_rms_weight: HbmTensor<bf16, Chip, m![H]> =
+            s.bf16(ctx, "post_ff_rms_weight", UNIT).await;
+
+        let up_weight_packed: HbmTensor<f4e2m1, Chip, m![L, H]> =
+            s.f4(ctx, "up_weight_packed").await;
+        let gate_weight_packed: HbmTensor<f4e2m1, Chip, m![L, H]> =
+            s.f4(ctx, "gate_weight_packed").await;
+        let down_weight_packed: HbmTensor<f4e2m1, Chip, m![H, L]> =
+            s.f4(ctx, "down_weight_packed").await;
+        let up_weight_scale: HbmTensor<f8e4m3, Chip, m![L, H / 16]> =
+            s.f8(ctx, "up_weight_scale", LOCAL_SCALE_EXP, false).await;
+        let gate_weight_scale: HbmTensor<f8e4m3, Chip, m![L, H / 16]> =
+            s.f8(ctx, "gate_weight_scale", LOCAL_SCALE_EXP, false).await;
+        let down_weight_scale: HbmTensor<f8e4m3, Chip, m![H, L / 16]> =
+            s.f8(ctx, "down_weight_scale", LOCAL_SCALE_EXP, false).await;
+
+        let up_global_scale: HbmTensor<f32, Chip, m![1]> = s
+            .constant_f32(ctx, "up_global_scale", &[1.0 / RAW_GLOBAL_SCALES[0]])
+            .await;
+        let gate_global_scale: HbmTensor<f32, Chip, m![1]> = s
+            .constant_f32(ctx, "gate_global_scale", &[1.0 / RAW_GLOBAL_SCALES[1]])
+            .await;
+        let down_global_scale: HbmTensor<f32, Chip, m![1]> = s
+            .constant_f32(ctx, "down_global_scale", &[1.0 / RAW_GLOBAL_SCALES[2]])
+            .await;
+
+        let layer_scalar: HbmTensor<bf16, Chip, m![1 # 8]> = s
+            .constant_bf16(ctx, "layer_scalar", &[LAYER_SCALAR; 8])
+            .await;
+
+        Self {
+            residual,
+            pre_ff_rms_weight,
+            post_ff_rms_weight,
+            up_weight_packed,
+            gate_weight_packed,
+            down_weight_packed,
+            up_weight_scale,
+            gate_weight_scale,
+            down_weight_scale,
+            up_global_scale,
+            gate_global_scale,
+            down_global_scale,
+            layer_scalar,
+        }
+    }
+
+    async fn execute(&mut self, ctx: &mut Context) -> Vec<(&'static str, Vec<f32>)> {
+        println!(
+            "DIAG_LAUNCH pid={} host_us={}",
+            std::process::id(),
+            host_us()
+        );
+        let launch_started = Instant::now();
+        launch(
+            ops::decoder_feedforward,
+            (
+                ctx,
+                &mut self.residual,
+                &self.pre_ff_rms_weight,
+                &self.up_weight_packed,
+                &self.gate_weight_packed,
+                &self.down_weight_packed,
+                &self.up_weight_scale,
+                &self.gate_weight_scale,
+                &self.down_weight_scale,
+                &self.up_global_scale,
+                &self.gate_global_scale,
+                &self.down_global_scale,
+                &self.post_ff_rms_weight,
+                &self.layer_scalar,
+            ),
+        )
+        .await;
+        println!(
+            "DIAG_HOST_LAUNCH elapsed_ns={}",
+            launch_started.elapsed().as_nanos()
+        );
+        vec![("expected", read_bf16(ctx, &self.residual).await)]
+    }
 }
 
 fn compare(label: &str, expected: &[f32], actual: &[f32], atol: f32, rtol: f32) -> bool {
@@ -692,28 +857,12 @@ fn host_us() -> u128 {
         .as_micros()
 }
 
-// Rotate and reverse the conditions across repetitions to reduce ordering bias.
-fn conditions() -> Vec<(usize, u64)> {
-    let delays = [0, 100, 250, 500, 750, 1000, 1500, 2000];
-    let mut result = Vec::new();
-    for repetition in 0..3 {
-        for offset in 0..delays.len() {
-            let index = if repetition % 2 == 0 {
-                (offset + repetition * 3) % delays.len()
-            } else {
-                (delays.len() - 1 - offset + repetition * 3) % delays.len()
-            };
-            result.push((repetition, delays[index]));
-        }
-    }
-    result
-}
-
 async fn measure(
     ctx: &mut Context,
     fixture: &Fixture,
     test: &Test,
     collector: &Collector,
+    prepared: &mut Prepared,
     label: &str,
     burst: usize,
 ) {
@@ -731,7 +880,7 @@ async fn measure(
         host_us()
     );
     let started = Instant::now();
-    let outputs = run_test(ctx, fixture, test.name).await;
+    let outputs = prepared.execute(ctx).await;
     let returned_us = started.elapsed().as_micros();
     let span = collector.take_task().await;
     let trace_wait_us = started.elapsed().as_micros() - returned_us;
@@ -769,45 +918,6 @@ async fn measure(
 async fn main() {
     assert!(profiling_enabled(), "TUC_PROFILE_LEVEL=info is required");
     let kernel = std::env::var("DIAG_KERNEL").expect("DIAG_KERNEL is required");
-    let mode = std::env::var("DIAG_MODE").expect("DIAG_MODE is required");
-    assert!(
-        matches!(mode.as_str(), "same" | "fresh"),
-        "unknown DIAG_MODE"
-    );
-    let child_label = std::env::var("DIAG_CHILD_LABEL").ok();
-
-    // The supervisor never acquires the NPU. Each child releases its context by
-    // normal process exit before the supervisor inserts the requested delay.
-    if mode == "fresh" && child_label.is_none() {
-        let executable = std::env::current_exe().unwrap();
-        let run_child = |label: &str| {
-            assert!(
-                std::process::Command::new(&executable)
-                    .env("DIAG_CHILD_LABEL", label)
-                    .status()
-                    .expect("start diagnostic child")
-                    .success(),
-                "diagnostic child failed"
-            );
-        };
-        run_child("mode=fresh phase=warmup repetition=0 delay_ms=0");
-        for (repetition, delay_ms) in conditions() {
-            let started = Instant::now();
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            println!(
-                "DIAG_SLEEP mode=fresh repetition={} delay_ms={} actual_us={}",
-                repetition,
-                delay_ms,
-                started.elapsed().as_micros()
-            );
-            run_child(&format!(
-                "mode=fresh phase=measure repetition={repetition} delay_ms={delay_ms}"
-            ));
-        }
-        println!("DIAG_COMPLETE kernel={kernel} mode=fresh measured=72 warmup=1");
-        return;
-    }
-
     let fixture = Fixture::load(&fixture_path());
     fixture.assert_every_expectation_is_tested();
     let test = TESTS
@@ -817,35 +927,77 @@ async fn main() {
     let collector = Collector::default();
     tracing::subscriber::set_global_default(collector.clone()).expect("set tracing subscriber");
     let mut ctx = Context::acquire();
-    if let Some(label) = child_label {
-        let count = if label.contains("phase=warmup") { 1 } else { 3 };
-        for burst in 0..count {
-            measure(&mut ctx, &fixture, test, &collector, &label, burst).await;
-        }
-        return;
+    // Exercise all kernel entry points before the experiment, so first-use
+    // loading of a different kernel cannot masquerade as a wake-up effect.
+    for bootstrap_test in TESTS {
+        let mut input = Prepared::new(&mut ctx, &fixture, bootstrap_test.name).await;
+        measure(&mut ctx, &fixture, bootstrap_test, &collector, &mut input,
+            "mode=cross condition=bootstrap repetition=0 phase=bootstrap", 0).await;
     }
-    measure(
-        &mut ctx,
-        &fixture,
-        test,
-        &collector,
-        "mode=same phase=warmup repetition=0 delay_ms=0",
-        0,
-    )
-    .await;
-    for (repetition, delay_ms) in conditions() {
-        let started = Instant::now();
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        println!(
-            "DIAG_SLEEP mode=same repetition={} delay_ms={} actual_us={}",
-            repetition,
-            delay_ms,
-            started.elapsed().as_micros()
-        );
-        let label = format!("mode=same phase=measure repetition={repetition} delay_ms={delay_ms}");
-        for burst in 0..3 {
-            measure(&mut ctx, &fixture, test, &collector, &label, burst).await;
+    let conditions = [
+        "none",
+        "sliding_project_qkv",
+        "sliding_attention_output",
+        "decoder_feedforward",
+    ];
+    for repetition in 0..3 {
+        for offset in 0..conditions.len() {
+            let condition = conditions[(offset + repetition) % conditions.len()];
+            // All allocations/transfers finish BEFORE the seed launch and idle gap.
+            // Every launch owns fresh input/output buffers, including residual and KV.
+            let mut seed = Prepared::new(&mut ctx, &fixture, test.name).await;
+            let mut targets = Vec::new();
+            for _ in 0..3 {
+                targets.push(Prepared::new(&mut ctx, &fixture, test.name).await);
+            }
+            let mut primer = if condition == "none" {
+                None
+            } else {
+                Some(Prepared::new(&mut ctx, &fixture, condition).await)
+            };
+            let label = format!("mode=cross condition={condition} repetition={repetition}");
+            measure(
+                &mut ctx,
+                &fixture,
+                test,
+                &collector,
+                &mut seed,
+                &format!("{label} phase=seed"),
+                0,
+            )
+            .await;
+            let slept = Instant::now();
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+            println!(
+                "DIAG_SLEEP {label} delay_ms=2000 actual_us={}",
+                slept.elapsed().as_micros()
+            );
+            if let Some(ref mut input) = primer {
+                let primer_test = TESTS.iter().find(|test| test.name == condition).unwrap();
+                measure(
+                    &mut ctx,
+                    &fixture,
+                    primer_test,
+                    &collector,
+                    input,
+                    &format!("{label} phase=primer"),
+                    0,
+                )
+                .await;
+            }
+            for (burst, input) in targets.iter_mut().enumerate() {
+                measure(
+                    &mut ctx,
+                    &fixture,
+                    test,
+                    &collector,
+                    input,
+                    &format!("{label} phase=measure"),
+                    burst,
+                )
+                .await;
+            }
         }
     }
-    println!("DIAG_COMPLETE kernel={kernel} mode=same measured=72 warmup=1");
+    println!("DIAG_COMPLETE kernel={kernel} mode=cross measured=36 seed=12 primer=9 bootstrap=3");
 }

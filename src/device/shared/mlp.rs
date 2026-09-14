@@ -84,8 +84,36 @@ fn prepare_up_input(
         .commit_trim::<m![H % 8]>()
         .commit();
 
+    // Coarse multiples of 16 are exactly representable in e4m3. Keep the
+    // existing [scale, scale / 16] reconstruction for the residual part.
+    let high_integer: DmTensor<f32, Chip, Cluster, m![H / 960, 1 # 64], m![H % 960]> = ctx.main
+        .begin(normalized.view())
+        .fetch::<m![H / 8 % 120], m![H % 8]>()
+        .collect::<m![H / 8 % 120], m![H % 8]>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_split::<m![H / 4 % 240], m![H % 4]>()
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 0.0625)
+        .vector_fp_binary(FpBinaryOp::AddF, 12582912.0)
+        .vector_widen_concat::<m![H / 8 % 120], m![H % 8]>()
+        .vector_final()
+        .commit_trim::<m![H % 8]>()
+        .commit();
+    let coarse: DmTensor<f32, Chip, Cluster, m![H / 960, 1 # 64], m![H % 960]> = ctx.main
+        .begin(high_integer.view())
+        .fetch::<m![H / 8 % 120], m![H % 8]>()
+        .collect::<m![H / 8 % 120], m![H % 8]>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_split::<m![H / 4 % 240], m![H % 4]>()
+        .vector_fp_binary(FpBinaryOp::SubF, 12582912.0)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), 16.0)
+        .vector_widen_concat::<m![H / 8 % 120], m![H % 8]>()
+        .vector_final()
+        .commit_trim::<m![H % 8]>()
+        .commit();
     let mut parts: DmTensor<f8e4m3, Chip, Cluster, m![H / 960, 1 # 64], m![Dummy2, H % 960]> = DmTensor::new();
-    ctx.main.begin(normalized.view())
+    ctx.main.begin(coarse.view())
         .fetch::<m![H / 8 % 120], m![H % 8]>()
         .collect::<m![H / 8 % 120], m![H % 8]>()
         .cast::<f8e4m3, m![H % 8 # 32]>()
@@ -93,9 +121,8 @@ fn prepare_up_input(
         .commit_view(parts.view_mut().tile::<m![Dummy2], 1, m![1 #{!} 2, H % 960]>(0));
 
     let high: VrfTensor<f32, Chip, Cluster, m![H / 960, 1 # 64], m![H % 960]> = ctx.sub
-        .begin(parts.view().tile::<m![Dummy2], 1, m![1 # 2, H % 960]>(0))
+        .begin(coarse.view())
         .fetch::<m![H / 8 % 120], m![H % 8]>()
-        .fetch_cast::<f32>()
         .collect::<m![H / 8 % 120], m![H % 8]>()
         .to_vrf();
     ctx.main.begin(normalized.view())
@@ -200,8 +227,36 @@ fn prepare_down_input(
         .commit_trim::<m![L % 8]>()
         .commit();
 
+    // Coarse multiples of 16 are exactly representable in e4m3. Keep the
+    // existing [scale, scale / 16] reconstruction for the residual part.
+    let high_integer: DmTensor<f32, Chip, UpCluster, m![L / 960 % 8, 1 # 32], m![L % 960]> = ctx.main
+        .begin(normalized.view())
+        .fetch::<m![L / 8 % 120], m![L % 8]>()
+        .collect::<m![L / 8 % 120], m![L % 8]>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_split::<m![L / 4 % 240], m![L % 4]>()
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 0.0625)
+        .vector_fp_binary(FpBinaryOp::AddF, 12582912.0)
+        .vector_widen_concat::<m![L / 8 % 120], m![L % 8]>()
+        .vector_final()
+        .commit_trim::<m![L % 8]>()
+        .commit();
+    let coarse: DmTensor<f32, Chip, UpCluster, m![L / 960 % 8, 1 # 32], m![L % 960]> = ctx.main
+        .begin(high_integer.view())
+        .fetch::<m![L / 8 % 120], m![L % 8]>()
+        .collect::<m![L / 8 % 120], m![L % 8]>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_split::<m![L / 4 % 240], m![L % 4]>()
+        .vector_fp_binary(FpBinaryOp::SubF, 12582912.0)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), 16.0)
+        .vector_widen_concat::<m![L / 8 % 120], m![L % 8]>()
+        .vector_final()
+        .commit_trim::<m![L % 8]>()
+        .commit();
     let mut parts: DmTensor<f8e4m3, Chip, UpCluster, m![L / 960 % 8, 1 # 32], m![Dummy2, L % 960]> = DmTensor::new();
-    ctx.main.begin(normalized.view())
+    ctx.main.begin(coarse.view())
         .fetch::<m![L / 8 % 120], m![L % 8]>()
         .collect::<m![L / 8 % 120], m![L % 8]>()
         .cast::<f8e4m3, m![L % 8 # 32]>()
@@ -209,9 +264,8 @@ fn prepare_down_input(
         .commit_view(parts.view_mut().tile::<m![Dummy2], 1, m![1 #{!} 2, L % 960]>(0));
 
     let high: VrfTensor<f32, Chip, UpCluster, m![L / 960 % 8, 1 # 32], m![L % 960]> = ctx.sub
-        .begin(parts.view().tile::<m![Dummy2], 1, m![1 # 2, L % 960]>(0))
+        .begin(coarse.view())
         .fetch::<m![L / 8 % 120], m![L % 8]>()
-        .fetch_cast::<f32>()
         .collect::<m![L / 8 % 120], m![L % 8]>()
         .to_vrf();
     ctx.main.begin(normalized.view())

@@ -257,10 +257,38 @@ pub(crate) fn project_output_k_sharded_distributed(
         .commit_trim::<m![Qs % 8]>()
         .commit();
 
+    // Coarse multiples of 16 are exactly representable in e4m3. Keep the
+    // existing [scale, scale / 16] reconstruction for the residual part.
+    let high_integer: DmTensor<f32, Chip, OutputCluster, KRows, m![Qs % 1024]> = ctx.main
+        .begin(normalized.view())
+        .fetch::<m![Qs / 8 % 128], m![Qs % 8]>()
+        .collect::<m![Qs / 8 % 128], m![Qs % 8]>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_split::<m![Qs / 4 % 256], m![Qs % 4]>()
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul0), 0.0625)
+        .vector_fp_binary(FpBinaryOp::AddF, 12582912.0)
+        .vector_widen_concat::<m![Qs / 8 % 128], m![Qs % 8]>()
+        .vector_final()
+        .commit_trim::<m![Qs % 8]>()
+        .commit();
+    let coarse: DmTensor<f32, Chip, OutputCluster, KRows, m![Qs % 1024]> = ctx.main
+        .begin(high_integer.view())
+        .fetch::<m![Qs / 8 % 128], m![Qs % 8]>()
+        .collect::<m![Qs / 8 % 128], m![Qs % 8]>()
+        .vector_init()
+        .vector_intra_slice_tag(TagMode::Zero)
+        .vector_narrow_split::<m![Qs / 4 % 256], m![Qs % 4]>()
+        .vector_fp_binary(FpBinaryOp::SubF, 12582912.0)
+        .vector_fp_binary(FpBinaryOp::MulF(FpMulAlu::Mul1), 16.0)
+        .vector_widen_concat::<m![Qs / 8 % 128], m![Qs % 8]>()
+        .vector_final()
+        .commit_trim::<m![Qs % 8]>()
+        .commit();
     let mut parts: DmTensor<f8e4m3, Chip, OutputCluster, KRows, m![Dummy8 % 2, Qs % 1024]> =
         DmTensor::new();
     ctx.main
-        .begin(normalized.view())
+        .begin(coarse.view())
         .fetch::<m![Qs / 8 % 128], m![Qs % 8]>()
         .collect::<m![Qs / 8 % 128], m![Qs % 8]>()
         .cast::<f8e4m3, m![Qs % 8 # 32]>()
@@ -269,9 +297,8 @@ pub(crate) fn project_output_k_sharded_distributed(
 
     let high_vrf: VrfTensor<f32, Chip, OutputCluster, KRows, m![Qs % 1024]> = ctx
         .sub
-        .begin(parts.view().tile::<m![Dummy8 % 2], 1, m![1 # 2, Qs % 1024]>(0))
+        .begin(coarse.view())
         .fetch::<m![Qs / 8 % 128], m![Qs % 8]>()
-        .fetch_cast::<f32>()
         .collect::<m![Qs / 8 % 128], m![Qs % 8]>()
         .to_vrf();
 

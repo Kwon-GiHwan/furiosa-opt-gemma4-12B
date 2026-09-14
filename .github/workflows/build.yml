@@ -23,6 +23,11 @@ jobs:
     # 툴체인이 x86_64 Linux + GLIBC 2.34 이상만 지원한다.
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [sliding_project_qkv, sliding_attention_output, decoder_feedforward]
+        mode: [same, fresh]
 
     env:
       FURIOSA_ARENA_TOKEN: ${{ secrets.FURIOSA_ARENA_TOKEN }}
@@ -103,11 +108,23 @@ jobs:
           chmod +x target/release/deps/test_kernels-diagnostic
           touch target/release/deps/test_kernels-diagnostic
 
+      - name: Configure remote diagnostic conditions
+        env:
+          DIAG_KERNEL: ${{ matrix.kernel }}
+          DIAG_MODE: ${{ matrix.mode }}
+        run: |
+          {
+            printf '#!/bin/sh\nexport DIAG_KERNEL="%s"\nexport DIAG_MODE="%s"\n' "$DIAG_KERNEL" "$DIAG_MODE"
+            printf '%s\n' 'export FURIOSA_VISIBLE_DEVICES="${FURIOSA_VISIBLE_DEVICES:-0}"' 'hostname' 'echo "visible_devices=$FURIOSA_VISIBLE_DEVICES"' 'if command -v furiosa-smi >/dev/null 2>&1; then furiosa-smi info --format full; fi'
+            cat scripts/rngd/remote_entrypoint.sh
+          } > target/diagnostic_entrypoint.sh
+          cp target/diagnostic_entrypoint.sh scripts/rngd/remote_entrypoint.sh
+
       - name: Run kernel tests on RNGD (accuracy + cycles)
         if: env.FURIOSA_ARENA_TOKEN != ''
         env:
           FURIOSA_ARENA_URL: ${{ vars.FURIOSA_ARENA_URL }}
-          RNGD_JOB_NAME: COSLAB
+          RNGD_JOB_NAME: COSLAB-${{ matrix.kernel }}-${{ matrix.mode }}
         run: ./scripts/rngd_test.sh --no-build 2>&1 | tee target/rngd_test.log
 
       # 제출한 작업의 status / log / result 를 내려받아 artifact 와 Summary 에 남긴다.
@@ -127,7 +144,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: stage1-${{ github.sha }}
+          name: diagnostic-${{ matrix.kernel }}-${{ matrix.mode }}-${{ github.sha }}
           if-no-files-found: error
           retention-days: 14
           path: |

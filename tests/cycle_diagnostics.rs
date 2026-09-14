@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use furiosa_opt_std::prelude::*;
 
@@ -427,6 +427,7 @@ async fn sliding_project_qkv(ctx: &mut Context, fixture: &Fixture) -> Vec<(&'sta
     let mut v_cache: HbmTensor<bf16, Chip, m![Ts, Ns, Ds]> = zeros(ctx).await;
     let mut q_out: HbmTensor<bf16, Chip, m![Ns, Gs, Ds]> = zeros(ctx).await;
 
+    println!("DIAG_LAUNCH pid={} host_us={}", std::process::id(), host_us());
     launch(
         ops::sliding_project_qkv,
         (
@@ -470,6 +471,7 @@ async fn sliding_attention_output(ctx: &mut Context, fixture: &Fixture) -> Vec<(
     let o_weight_scale: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "o_weight_scale", ROW_SCALE).await;
     let mut residual: HbmTensor<bf16, Chip, m![H]> = s.bf16(ctx, "residual", UNIT).await;
 
+    println!("DIAG_LAUNCH pid={} host_us={}", std::process::id(), host_us());
     launch(
         ops::sliding_attention_output,
         (
@@ -514,6 +516,7 @@ async fn decoder_feedforward(ctx: &mut Context, fixture: &Fixture) -> Vec<(&'sta
 
     let layer_scalar: HbmTensor<bf16, Chip, m![1 # 8]> = s.constant_bf16(ctx, "layer_scalar", &[LAYER_SCALAR; 8]).await;
 
+    println!("DIAG_LAUNCH pid={} host_us={}", std::process::id(), host_us());
     launch(
         ops::decoder_feedforward,
         (
@@ -603,17 +606,21 @@ struct Collector {
 }
 
 impl Collector {
-    fn clear(&self) {
-        self.spans.lock().unwrap().clear();
-    }
-
-    /// Real total cycles for whatever ran since the last `clear`: the union of every
-    /// span observed (min begin .. max end).
-    fn window_cycles(&self) -> Option<u64> {
-        let spans = self.spans.lock().unwrap();
-        let begin = spans.iter().map(|s| s.begin).min()?;
-        let end = spans.iter().map(|s| s.end).max()?;
-        Some(end.saturating_sub(begin))
+    async fn take_task(&self) -> Span {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                {
+                    let mut spans = self.spans.lock().unwrap();
+                    assert!(spans.len() <= 1, "multiple Task spans for one launch");
+                    if let Some(span) = spans.pop() {
+                        return span;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("Task trace missing after 5 seconds")
     }
 }
 
@@ -634,10 +641,14 @@ impl tracing::field::Visit for FieldExtractor {
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "name" { self.name = value.to_string(); }
+        if field.name() == "name" {
+            self.name = value.to_string();
+        }
     }
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "name" { self.name = format!("{value:?}"); }
+        if field.name() == "name" {
+            self.name = format!("{value:?}");
+        }
     }
 }
 
@@ -651,7 +662,7 @@ impl tracing::Subscriber for Collector {
             let mut extractor = FieldExtractor::default();
             attrs.record(&mut extractor);
             if let (Some(begin), Some(end)) = (extractor.begin, extractor.end) {
-                println!("RAW_SPAN name={} begin={} end={} duration={}", extractor.name, begin, end, end.saturating_sub(begin));
+                assert_eq!(extractor.name, "Task", "unexpected profile span");
                 self.spans.lock().unwrap().push(Span { begin, end });
             }
         }
@@ -668,94 +679,173 @@ impl tracing::Subscriber for Collector {
 }
 
 fn profiling_enabled() -> bool {
-    let level = std::env::var("TUC_PROFILE_LEVEL").unwrap_or_default().to_ascii_lowercase();
+    let level = std::env::var("TUC_PROFILE_LEVEL")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     matches!(level.as_str(), "info" | "debug" | "trace")
 }
 
-fn settle() -> Duration {
-    let ms = std::env::var("GEMMA4_PROFILE_SETTLE_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(500u64);
-    Duration::from_millis(ms)
+fn host_us() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros()
+}
+
+// Rotate and reverse the conditions across repetitions to reduce ordering bias.
+fn conditions() -> Vec<(usize, u64)> {
+    let delays = [0, 100, 250, 500, 750, 1000, 1500, 2000];
+    let mut result = Vec::new();
+    for repetition in 0..3 {
+        for offset in 0..delays.len() {
+            let index = if repetition % 2 == 0 {
+                (offset + repetition * 3) % delays.len()
+            } else {
+                (delays.len() - 1 - offset + repetition * 3) % delays.len()
+            };
+            result.push((repetition, delays[index]));
+        }
+    }
+    result
+}
+
+async fn measure(
+    ctx: &mut Context,
+    fixture: &Fixture,
+    test: &Test,
+    collector: &Collector,
+    label: &str,
+    burst: usize,
+) {
+    assert!(
+        collector.spans.lock().unwrap().is_empty(),
+        "unconsumed Task trace"
+    );
+    println!("==> {}", test.name);
+    println!(
+        "DIAG_CASE kernel={} {} burst={} pid={} host_us={}",
+        test.name,
+        label,
+        burst,
+        std::process::id(),
+        host_us()
+    );
+    let started = Instant::now();
+    let outputs = run_test(ctx, fixture, test.name).await;
+    let returned_us = started.elapsed().as_micros();
+    let span = collector.take_task().await;
+    let trace_wait_us = started.elapsed().as_micros() - returned_us;
+    assert!(span.end >= span.begin, "invalid Task timestamps");
+    println!(
+        "DIAG_RESULT kernel={} {} burst={} pid={} begin={} end={} cycles={} shim_us={} trace_wait_us={}",
+        test.name,
+        label,
+        burst,
+        std::process::id(),
+        span.begin,
+        span.end,
+        span.end - span.begin,
+        returned_us,
+        trace_wait_us
+    );
+    assert!(!outputs.is_empty(), "shim produced no outputs");
+    for (label, actual) in &outputs {
+        assert!(
+            compare(
+                label,
+                fixture.expect(test.name, label),
+                actual,
+                test.atol,
+                test.rtol
+            ),
+            "accuracy failure in {}",
+            test.name
+        );
+    }
+    println!("    cycles={}", span.end - span.begin);
 }
 
 #[tokio::main]
 async fn main() {
+    assert!(profiling_enabled(), "TUC_PROFILE_LEVEL=info is required");
+    let kernel = std::env::var("DIAG_KERNEL").expect("DIAG_KERNEL is required");
+    let mode = std::env::var("DIAG_MODE").expect("DIAG_MODE is required");
+    assert!(
+        matches!(mode.as_str(), "same" | "fresh"),
+        "unknown DIAG_MODE"
+    );
+    let child_label = std::env::var("DIAG_CHILD_LABEL").ok();
+
+    // The supervisor never acquires the NPU. Each child releases its context by
+    // normal process exit before the supervisor inserts the requested delay.
+    if mode == "fresh" && child_label.is_none() {
+        let executable = std::env::current_exe().unwrap();
+        let run_child = |label: &str| {
+            assert!(
+                std::process::Command::new(&executable)
+                    .env("DIAG_CHILD_LABEL", label)
+                    .status()
+                    .expect("start diagnostic child")
+                    .success(),
+                "diagnostic child failed"
+            );
+        };
+        run_child("mode=fresh phase=warmup repetition=0 delay_ms=0");
+        for (repetition, delay_ms) in conditions() {
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            println!(
+                "DIAG_SLEEP mode=fresh repetition={} delay_ms={} actual_us={}",
+                repetition,
+                delay_ms,
+                started.elapsed().as_micros()
+            );
+            run_child(&format!(
+                "mode=fresh phase=measure repetition={repetition} delay_ms={delay_ms}"
+            ));
+        }
+        println!("DIAG_COMPLETE kernel={kernel} mode=fresh measured=72 warmup=1");
+        return;
+    }
+
     let fixture = Fixture::load(&fixture_path());
     fixture.assert_every_expectation_is_tested();
-    let mut ctx = Context::acquire();
-
-    let profile = profiling_enabled();
+    let test = TESTS
+        .iter()
+        .find(|test| test.name == kernel)
+        .expect("unknown kernel");
     let collector = Collector::default();
-    if profile {
-        tracing::subscriber::set_global_default(collector.clone()).expect("set global tracing subscriber");
+    tracing::subscriber::set_global_default(collector.clone()).expect("set tracing subscriber");
+    let mut ctx = Context::acquire();
+    if let Some(label) = child_label {
+        let count = if label.contains("phase=warmup") { 1 } else { 3 };
+        for burst in 0..count {
+            measure(&mut ctx, &fixture, test, &collector, &label, burst).await;
+        }
+        return;
     }
-    let _configured_settle = settle();
-
-    println!(
-        "NPU kernel tests -- {} cases against a precomputed reference{}\n",
-        TESTS.len(),
-        if profile { ", with on-device cycle counts" } else { "" }
-    );
-
-    let mut failures = Vec::new();
-    for (iteration, test) in TESTS.iter().cycle().take(TESTS.len() * 6).enumerate() {
-        let settle = Duration::from_millis(if (iteration / TESTS.len()) % 2 == 0 { 500 } else { 2000 });
-        if profile {
-            println!("==> {} iteration={} settle_ms={}", test.name, iteration / TESTS.len(), settle.as_millis());
-            collector.clear();
-        }
-
-        let outputs = run_test(&mut ctx, &fixture, test.name).await;
-
-        let cycles = if profile {
-            // Spans are decoded off the launch hot path during deferred read-back, not
-            // synchronously with `run_test(..).await` returning.
-            tokio::time::sleep(settle).await;
-            collector.window_cycles()
-        } else {
-            None
-        };
-
-        assert!(
-            !outputs.is_empty(),
-            "{}: shim produced no outputs to compare",
-            test.name
-        );
-        let mut ok = true;
-        for (label, actual) in &outputs {
-            let display = if outputs.len() == 1 {
-                test.name.to_string()
-            } else {
-                format!("{} {}", test.name, label.trim_start_matches("expected."))
-            };
-            ok &= compare(&display, fixture.expect(test.name, label), actual, test.atol, test.rtol);
-        }
-
-        if profile {
-            match cycles {
-                Some(c) => println!("    cycles={c}"),
-                None => println!("    cycles=none observed"),
-            }
-            println!();
-        }
-
-        if !ok {
-            failures.push(test.name);
-        }
-    }
-
-    println!();
-    if failures.is_empty() {
-        println!("all {} tests passed", TESTS.len());
-    } else {
+    measure(
+        &mut ctx,
+        &fixture,
+        test,
+        &collector,
+        "mode=same phase=warmup repetition=0 delay_ms=0",
+        0,
+    )
+    .await;
+    for (repetition, delay_ms) in conditions() {
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         println!(
-            "{} of {} tests failed: {}",
-            failures.len(),
-            TESTS.len(),
-            failures.join(", ")
+            "DIAG_SLEEP mode=same repetition={} delay_ms={} actual_us={}",
+            repetition,
+            delay_ms,
+            started.elapsed().as_micros()
         );
+        let label = format!("mode=same phase=measure repetition={repetition} delay_ms={delay_ms}");
+        for burst in 0..3 {
+            measure(&mut ctx, &fixture, test, &collector, &label, burst).await;
+        }
     }
-    std::process::exit(i32::from(!failures.is_empty()));
+    println!("DIAG_COMPLETE kernel={kernel} mode=same measured=72 warmup=1");
 }
